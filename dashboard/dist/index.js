@@ -31,15 +31,16 @@
 
   function Bar(props) {
     const pct = props.pct == null ? null : Math.max(0, Math.min(100, props.pct));
-    const tone = pct == null ? "bg-muted" : pct >= 90 ? "bg-red-500" : pct >= 70 ? "bg-amber-500" : "bg-emerald-500";
+    // Inline colours: the host's Tailwind build only ships classes it uses itself, so bg-emerald-500 & co. would be purged.
+    const tone = pct == null ? "transparent" : pct >= 90 ? "#ef4444" : pct >= 70 ? "#f59e0b" : "#10b981";
     return h("div", { className: "space-y-1" },
       h("div", { className: "flex justify-between text-xs" },
         h("span", null, props.label),
         h("span", { className: "text-muted-foreground" },
           pct == null ? "—" : pct.toFixed(0) + "%",
           props.resetAt ? " · resets in " + fmtIn(props.resetAt) : "")),
-      h("div", { className: "h-2 w-full rounded bg-muted overflow-hidden" },
-        h("div", { className: cn("h-full rounded", tone), style: { width: (pct == null ? 0 : pct) + "%" } })));
+      h("div", { className: "h-2 w-full rounded bg-muted overflow-hidden", style: { border: "1px solid hsl(var(--border, 0 0% 50%) / 0.4)" } },
+        h("div", { className: "h-full rounded", style: { width: (pct == null ? 0 : pct) + "%", backgroundColor: tone, transition: "width .3s" } })));
   }
 
   function StatusBadge(a) {
