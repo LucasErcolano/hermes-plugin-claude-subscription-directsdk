@@ -12,10 +12,12 @@ try:
     from .model_catalog import ALIASES, MODEL_METADATA, MODEL_CAPABILITIES, PICKER_ROUTES, native_model
     from .directsdk_setup import INSTALL_HINT, _resolve
     from .extra_usage import usage_percent as _percent
+    from .accounts import auth_handler
 except ImportError:
     from model_catalog import ALIASES, MODEL_METADATA, MODEL_CAPABILITIES, PICKER_ROUTES, native_model
     from directsdk_setup import INSTALL_HINT, _resolve
     from extra_usage import usage_percent as _percent
+    from accounts import auth_handler
 
 logger = logging.getLogger(__name__)
 
@@ -160,9 +162,17 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
     def setup_status(self, **kwargs):
         try:
             from .directsdk_setup import setup_status
+            from .accounts import any_pooled_login
         except ImportError:
             from directsdk_setup import setup_status
-        return setup_status(**kwargs)
+            from accounts import any_pooled_login
+        status = setup_status(**kwargs)
+        if status['available'] and not status['logged_in']:
+            # Pooled subscriptions each live in their own config dir; any signed-in one satisfies setup.
+            pooled = any_pooled_login(command=kwargs.get('command'), env=kwargs.get('env'))
+            if pooled:
+                status.update(logged_in=True, plan=pooled['plan'], detail='')
+        return status
 
     def discover_models(self, **kwargs):
         try:
@@ -252,6 +262,8 @@ profile = ClaudeOAuthDirectSDKProfile(
     model_aliases={alias: native_model(alias) for alias in ALIASES},
     # A dataclass field (Hermes >= 0.21.4), so a method on the subclass would be shadowed by its None default.
     classify_api_error=classify_api_error,
+    # `hermes auth add|status|logout <name>`: pool several Claude subscriptions, one Claude Code login each.
+    auth_handler=auth_handler,
 )
 # Attribute assignment keeps the plugin loadable on hosts predating this capability.
 # Newer hosts use it to avoid buffering a healthy native stream behind a stale-call timer.

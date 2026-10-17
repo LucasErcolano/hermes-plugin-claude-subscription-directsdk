@@ -15,6 +15,7 @@ import socket
 import ssl
 import sys
 import threading
+import time
 from urllib.parse import unquote, urlsplit
 import urllib.request
 
@@ -701,6 +702,7 @@ class Admission:
         self.auth_retry_used = False
         self.request_id = None
         self.status = None
+        self.reset_epoch = None  # anthropic-ratelimit-unified-reset of a 429: when the binding window reopens
         self.failure = None
         self.unrestored = None
         self.capture = Capture()
@@ -898,6 +900,13 @@ class Handler(BaseHTTPRequestHandler):
             del headers, payload, wire
             gate.request_id = response.getheader('request-id') or response.getheader('x-request-id')
             gate.status = response.status
+            if response.status == 429:
+                reset = response.getheader('anthropic-ratelimit-unified-reset') or response.getheader('retry-after')
+                try:
+                    value = float(reset)
+                    gate.reset_epoch = value if value > 1_000_000_000 else time.time() + value
+                except (TypeError, ValueError):
+                    gate.reset_epoch = None
             self.send_response(response.status)
             for key, value in response.getheaders():
                 if key.lower() not in ('connection','transfer-encoding','server','date'):

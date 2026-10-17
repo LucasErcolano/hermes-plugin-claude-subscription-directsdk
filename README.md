@@ -82,6 +82,34 @@ model:
 
 Auxiliary/fallback routing remains owned by Hermes. Configure those routes explicitly if they must also use the subscription; this provider does not silently change other selected providers.
 
+### Several subscriptions (rotate on a plan limit)
+
+Pool more than one Claude subscription; Hermes moves to the next login when one hits its
+session or weekly limit and benches the exhausted one until the reset time Anthropic reports:
+
+```bash
+hermes auth add claude-subscription-directsdk-experimental --label work   # runs `claude auth login` into its own directory
+hermes auth add claude-subscription-directsdk-experimental --label home
+hermes auth list claude-subscription-directsdk-experimental               # order = priority; `hermes auth priority` reorders
+hermes auth status claude-subscription-directsdk-experimental
+```
+
+Each pooled login lives in its own `CLAUDE_CONFIG_DIR` under `<hermes home>/plugin-data/claude-subscription-directsdk-experimental/accounts/`;
+the pool row holds only that path (`claude-config-dir:/…`), never a token, so Claude Code keeps
+owning and refreshing each login. To pool a login that already exists (for example the default
+`~/.claude`), adopt it instead of signing in again:
+
+```bash
+CLAUDE_SUBSCRIPTION_DIRECTSDK_ADOPT_CONFIG_DIR=~/.claude hermes auth add claude-subscription-directsdk-experimental --label default
+```
+
+Once the pool has entries it is the only source of logins for this provider; the single
+default login is used when the pool is empty. `hermes auth logout` on the provider signs every
+pooled login out and removes directories the plugin created (adopted ones stay). Rotation is
+core's standard credential-pool path: a plan-limit answer is reported as a 429 carrying
+`usage_limit_reached` and `resets_at` (from `anthropic-ratelimit-unified-reset`, else parsed
+from native's "resets …" text), so `hermes auth list` shows the benched entry and when it reopens.
+
 ### Proxies
 
 The relay opens the upstream connection itself, so it applies native's proxy variables from the Hermes process environment: `https_proxy`/`HTTPS_PROXY`, then `http_proxy`/`HTTP_PROXY`, with `NO_PROXY` exceptions (standard-library matching; comma- or space-separated). The proxy must be an `http://` CONNECT proxy; `user:pass@` in its URL becomes a `Proxy-Authorization` header. TLS still terminates at `api.anthropic.com`, so the subscription bearer never reaches the proxy. A SOCKS or TLS-to-proxy URL is ignored with a warning and the relay connects directly, as it did before proxy support. For a proxy that must never be bypassed, use the `upstream_proxy` setting below, which fails closed.

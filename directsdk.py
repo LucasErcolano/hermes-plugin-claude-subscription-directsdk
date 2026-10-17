@@ -34,6 +34,7 @@ try:
         ClaudeCodeLoggedOut, INSTALL_HINT, LOGGED_OUT_HINT, _resolve as resolve_claude, apply_config_dir, apply_profile_credential,
         apply_traffic_policy, check_extra_usage, drop_api_credentials, egress_env, max_concurrent, observe_rate_limit,
         reap_orphaned_refresh_lock, relay, resolve_upstream, Upstream)
+    from .accounts import account_dir, reset_epoch_from_message
 except ImportError:
     import concurrency
     from model_catalog import accepts_thinking_disable, native_model, supports_adaptive_thinking
@@ -42,6 +43,7 @@ except ImportError:
         ClaudeCodeLoggedOut, INSTALL_HINT, LOGGED_OUT_HINT, _resolve as resolve_claude, apply_config_dir, apply_profile_credential,
         apply_traffic_policy, check_extra_usage, drop_api_credentials, egress_env, max_concurrent, observe_rate_limit,
         reap_orphaned_refresh_lock, relay, resolve_upstream, Upstream)
+    from accounts import account_dir, reset_epoch_from_message
 
 
 logger = logging.getLogger(__name__)
@@ -59,19 +61,40 @@ def _request_id(value):
 
 
 class ClaudeAPIError(RuntimeError):
-    """A failed upstream or native-answered request; status_code is None when there is no HTTP equivalent."""
+    """A failed upstream or native-answered request; status_code is None when there is no HTTP equivalent.
 
-    def __init__(self, message, status_code=None, *, request_id=None):
+    ``body`` mirrors the Anthropic error shape so Hermes' classifier and credential pool read it
+    like an HTTP 429: ``error.type`` (``usage_limit_reached`` for a plan limit) and ``resets_at``
+    (epoch seconds) let core rotate to the next pooled subscription and bench this one until
+    its window reopens instead of retrying or benching it for a flat hour."""
+
+    def __init__(self, message, status_code=None, body=None, *, request_id=None):
         request_id = _request_id(request_id)
         if request_id:
             message += f' (request_id={request_id})'
         super().__init__(message)
         self.status_code = status_code
+        self.body = body
         self.request_id = request_id
 
 
 class RequestRejected(ValueError):
     """A request this transport cannot serve, refused before Claude Code starts: the same input fails every time."""
+
+
+_LIMIT_WORDS = ('hit your', 'limit')
+
+
+def native_limit_body(message, now=None):
+    """The 429 body for native's plan-limit text; ``None`` when the text is not a plan limit."""
+    text = (message or '').lower()
+    if not all(word in text for word in _LIMIT_WORDS):
+        return None
+    from_message = reset_epoch_from_message(message, now=now)
+    error = {'type': 'usage_limit_reached', 'message': message}
+    if from_message is not None:
+        error['resets_at'] = from_message
+    return {'error': error}
 
 
 # Native's own error codes for errors it answers without a relayed upstream status.
@@ -808,9 +831,11 @@ class Client:
     HERMES_SKIP_TRANSPORT_WRAP = True
     HERMES_SKIP_ASYNC_WRAP = True
 
-    def __init__(self, command=None, args=None, env=None, timeout=180, **_):
+    def __init__(self, command=None, args=None, env=None, timeout=180, api_key=None, **_):
         # Hermes snapshots routing metadata from client-shaped objects; this is not a credential.
-        self.api_key = 'external-process'
+        # A pooled subscription arrives as ``claude-config-dir:<path>`` (see accounts.py): the row's
+        # reference, which core also uses to attribute a failure to the right pool entry.
+        self.api_key = api_key if account_dir(api_key) else 'external-process'
         self.base_url = 'process://claude-subscription-directsdk-experimental'
         self.env = dict(env) if env is not None else None
         source_env = self.env if self.env is not None else os.environ
@@ -938,6 +963,10 @@ class Client:
                 if self.env is None:
                     # The serving profile's own token, or none when its claude_config_dir picks the login.
                     apply_profile_credential(env)
+                pooled = account_dir(self.api_key)
+                if pooled:
+                    # The pooled login wins over every directory setting: that is what the pool entry means.
+                    env['CLAUDE_CONFIG_DIR'] = pooled
                 # A refresh lock an earlier native left mid-refresh would fail this request (claude-code#95236).
                 reap_orphaned_refresh_lock(env)
                 # Anthropic or the profile's opted-in gateway; an explicit Client(env=...) fixture may name its own.
@@ -1151,8 +1180,14 @@ class Client:
                             first += ', upstream said: ' + admission.error_text()[:500]
                         # The first attempt's real HTTP status; a 200 cut short or a relay failure has none.
                         status = admission.status if isinstance(admission.status, int) and admission.status >= 400 else None
+                        body = None
+                        if status == 429:
+                            # Upstream's own plan-limit answer: its reset header beats the message grammar.
+                            body = native_limit_body(native_error or admission.error_text()) or {'error': {'type': 'rate_limit_error', 'message': admission.error_text()[:500]}}
+                            if admission.reset_epoch is not None:
+                                body['error']['resets_at'] = admission.reset_epoch
                         raise ClaudeAPIError(f'Incomplete upstream response ({first})' + (': ' + native_error if native_error else ''),
-                                             status, request_id=admission.request_id)
+                                             status, body, request_id=admission.request_id)
                     assistants = [admission.capture.message]
                     stopped = True
                 native_failure_handled = admission.denied or (admission.used and assistants[0].get('stop_reason') == 'refusal')
@@ -1164,7 +1199,8 @@ class Client:
                         home = env.get('HOME') or env.get('USERPROFILE')
                         login = env.get('CLAUDE_CONFIG_DIR') or str((Path(home) if home else Path.home()) / '.claude')
                         raise ClaudeCodeLoggedOut(f'{LOGGED_OUT_HINT} (native: {native_error}; cli: {resolved[0]}; login: {login}){_stderr_tail(native_stderr)}')
-                    raise ClaudeAPIError('Native API error: ' + native_error, NATIVE_ERROR_STATUS.get(str(native_error_code)))
+                    raise ClaudeAPIError('Native API error: ' + native_error, NATIVE_ERROR_STATUS.get(str(native_error_code)),
+                                         native_limit_body(native_error) if native_error_code == 'rate_limit' else None)
                 if len(results) != 1 or not assistants or not stopped:
                     raise RuntimeError('Incomplete native response: assistant, message_stop and one result required')
                 final = results[0]

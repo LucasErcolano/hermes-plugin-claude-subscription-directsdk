@@ -22,6 +22,11 @@
 - A multiplexed gateway (`gateway.multiplex_profiles: true`) runs each profile's Claude Code on that profile's own login. `CLAUDE_CODE_OAUTH_TOKEN` in a served profile's `.env` now reaches its Claude Code children (read from core's per-turn secret scope; multiplexing never loads it into the process environment). A served profile without a token of its own no longer inherits the gateway process's token, `ANTHROPIC_CUSTOM_HEADERS` or `CLAUDE_CONFIG_DIR`, with or without `claude_config_dir` (Claude Code prefers the token over the selected login directory), so no profile runs on another profile's account. A served profile with neither its own token nor its own config directory is refused with a login error naming both ways to give it one (`claude_config_dir`, or `CLAUDE_CODE_OAUTH_TOKEN` in its `.env`), since Claude Code would otherwise read `~/.claude` under the inherited home. With no secret scope bound, the request and the setup probes fail closed instead of guessing. Single-profile installs and an explicit `Client(env=...)` are unchanged, and the process environment is never modified (#34, #313, thanks @kalfian).
 - `/usage` shows the extra-usage state, usage credits spent, this week's share per surface and the per-model limits beside the plan limits. They were dropped whenever Claude Code answered with `limits`, which current versions always do.
 - `/usage` shows the plan limits with `claude_code_telemetry: false`: the CLI skips its `get_usage` fetch under `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, so the zero-inference usage probe no longer sets that one flag (telemetry and error reporting stay off; a flag the user exported is kept).
+## [0.3.4] - Unreleased
+
+### Added
+
+- Several Claude subscriptions as pooled credentials: `hermes auth add|status|logout <provider>` keeps one Claude Code login per `CLAUDE_CONFIG_DIR` under the plugin's data directory (or adopts an existing one via `CLAUDE_SUBSCRIPTION_DIRECTSDK_ADOPT_CONFIG_DIR`), and a session/weekly limit is raised as a 429 with `usage_limit_reached` + `resets_at` so Hermes core rotates to the next login and benches the exhausted one until its window reopens. Pool rows hold a directory reference, never a token.
 
 ## [0.3.1] - Unreleased
 
