@@ -171,19 +171,42 @@ def _add(args):
     label = (getattr(args, "label", None) or "").strip()
     if not label and sys.stdin.isatty():
         label = input(f"Label (optional, default: {default_label}): ").strip()
-    label = label or default_label
+    entry = register_dir(config_dir, label or default_label, priority=getattr(args, "priority", None))
+    _print(f'Added {PLUGIN_ID} credential #{entry.priority + 1}: "{entry.label}" ({status["plan"] or "subscription"}, {config_dir})',
+           f"Hermes rotates to the next pooled login when one hits its session or weekly limit; "
+           f"`hermes auth list {PLUGIN_ID}` shows the order.")
+    return True
+
+
+def register_dir(config_dir, label, priority=None):
+    """Append ``config_dir`` to the pool as one login (the row stores only the path)."""
+    from agent.credential_pool import AUTH_TYPE_API_KEY, SOURCE_MANUAL, PooledCredential, load_pool
+    pool = load_pool(PLUGIN_ID)
     entry = PooledCredential(provider=PLUGIN_ID, id=uuid.uuid4().hex[:6], label=label, auth_type=AUTH_TYPE_API_KEY,
                              priority=0, source=SOURCE_MANUAL, access_token=account_ref(config_dir), base_url=BASE_URL)
     entry = pool.add_entry(entry)
-    priority = getattr(args, "priority", None)
     if priority is not None:
         moved = load_pool(PLUGIN_ID).move_entry(entry.id, int(priority))
         if moved is not None:
             entry = moved
-    _print(f'Added {PLUGIN_ID} credential #{entry.priority + 1}: "{label}" ({status["plan"] or "subscription"}, {config_dir})',
-           f"Hermes rotates to the next pooled login when one hits its session or weekly limit; "
-           f"`hermes auth list {PLUGIN_ID}` shows the order.")
-    return True
+    return entry
+
+
+def remove_account(credential_id):
+    """Sign one pooled login out, drop its row and (if the plugin created it) its directory."""
+    from agent.credential_pool import load_pool
+    pool = load_pool(PLUGIN_ID)
+    for index, entry in enumerate(pool.entries(), start=1):
+        if entry.id != credential_id:
+            continue
+        path = account_dir(entry.access_token)
+        if path:
+            logout(path)
+        pool.remove_index(index)
+        if path:
+            _remove_dir(path)
+        return entry
+    return None
 
 
 def _status(_args):
@@ -212,13 +235,8 @@ def _logout(_args):
     rows = pool_accounts()
     if not rows:
         return False  # single-login mode: core's own logout path
-    pool = load_pool(PLUGIN_ID)
     for entry, path in rows:
-        logout(path)
-        index = next((i for i, e in enumerate(pool.entries(), start=1) if e.id == entry.id), None)
-        if index is not None:
-            pool.remove_index(index)  # 1-based, like `hermes auth remove`
-        _remove_dir(path)
+        remove_account(entry.id)
         _print(f'Logged out and removed "{entry.label}" ({path})')
     return True
 

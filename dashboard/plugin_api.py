@@ -168,3 +168,172 @@ def refresh() -> Dict[str, Any]:
         _usage_cache.clear()
         _status_cache.clear()
     return {"ok": True}
+
+
+@router.delete("/accounts/{credential_id}")
+def remove_account(credential_id: str) -> Dict[str, Any]:
+    removed = _module("accounts").remove_account(credential_id)
+    if removed is None:
+        raise HTTPException(status_code=404, detail="no such pooled credential")
+    with _lock:
+        _usage_cache.clear()
+        _status_cache.clear()
+    return {"ok": True, "id": removed.id, "label": removed.label}
+
+
+# --- Add an account from the page: the official `claude auth login` on a pty -------------------
+#
+# Same shape as the vault form: the browser posts the pasted OAuth code straight to this process,
+# which types it into the CLI's own prompt. The code never reaches chat, logs or the model; the
+# OAuth grant lands in the new login's CLAUDE_CONFIG_DIR exactly as a terminal login would.
+
+import os
+import pty
+import re
+import select
+import subprocess
+import uuid
+
+LOGIN_TTL = 600.0
+_logins: Dict[str, "_Login"] = {}
+_URL_RE = re.compile(r"https://claude\.com/\S+")
+_ANSI_RE = re.compile(r"\x1b\][^\x07]*\x07|\x1b\[[0-9;]*[A-Za-z]")
+
+
+class _Login:
+    def __init__(self, label: str):
+        accounts = _module("accounts")
+        setup = _module("directsdk_setup")
+        self.id = uuid.uuid4().hex[:12]
+        self.label = label
+        self.created = time.time()
+        self.config_dir = accounts.new_account_dir()
+        self.url: Optional[str] = None
+        self.state = "starting"  # starting | awaiting_code | verifying | done | failed
+        self.error = ""
+        self.output = ""
+        self.entry_id: Optional[str] = None
+        env = setup._child_env(dict(os.environ))
+        env["CLAUDE_CONFIG_DIR"] = str(self.config_dir)
+        env["TERM"] = "dumb"
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        command = setup._resolve(None, env)
+        if command is None:
+            raise HTTPException(status_code=503, detail="Claude Code CLI is not installed on the dashboard host")
+        self.master, slave = pty.openpty()
+        self.proc = subprocess.Popen(command + ["auth", "login", "--claudeai"], stdin=slave, stdout=slave, stderr=slave,
+                                     env=env, close_fds=True)
+        os.close(slave)
+        self.thread = threading.Thread(target=self._pump, daemon=True)
+        self.thread.start()
+
+    def _pump(self):
+        accounts = _module("accounts")
+        while True:
+            r, _, _ = select.select([self.master], [], [], 0.5)
+            if r:
+                try:
+                    chunk = os.read(self.master, 4096)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    break
+                text = _ANSI_RE.sub("", chunk.decode("utf-8", "replace"))
+                self.output = (self.output + text)[-4000:]
+                if self.url is None:
+                    m = _URL_RE.search(self.output.replace("\r", "").replace("\n", ""))
+                    if m:
+                        self.url = m.group(0).rstrip(".,")
+                if self.state == "starting" and "Paste code here" in self.output:
+                    self.state = "awaiting_code"
+                if self.state == "verifying" and "Invalid code" in self.output.split("Paste code here")[-1]:
+                    self.state = "awaiting_code"
+                    self.error = "Invalid code — copy the full code from the Claude page and try again."
+                    self.output = ""
+            if self.proc.poll() is not None:
+                break
+        rc = self.proc.returncode
+        status = accounts.auth_status(self.config_dir)
+        if status["logged_in"]:
+            entry = accounts.register_dir(self.config_dir, self.label or f"claude-{status['plan'] or 'subscription'}")
+            self.entry_id = entry.id
+            self.state = "done"
+            with _lock:
+                _status_cache.clear()
+        else:
+            self.state = "failed"
+            self.error = self.error or f"`claude auth login` exited with {rc} without a login"
+            accounts._remove_dir(self.config_dir)
+        try:
+            os.close(self.master)
+        except OSError:
+            pass
+
+    def submit(self, code: str):
+        if self.state != "awaiting_code":
+            raise HTTPException(status_code=409, detail=f"login is {self.state}")
+        self.state = "verifying"
+        self.error = ""
+        os.write(self.master, (code.strip() + "\r").encode())
+
+    def cancel(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+
+    def view(self) -> Dict[str, Any]:
+        return {"id": self.id, "label": self.label, "state": self.state, "url": self.url, "error": self.error,
+                "entry_id": self.entry_id, "expires_in": max(0, int(self.created + LOGIN_TTL - time.time()))}
+
+
+def _reap():
+    now = time.time()
+    for key, login in list(_logins.items()):
+        if now - login.created > LOGIN_TTL or login.state in ("done", "failed") and now - login.created > 120:
+            login.cancel()
+            _logins.pop(key, None)
+
+
+def _login(login_id: str) -> "_Login":
+    _reap()
+    login = _logins.get(login_id)
+    if login is None:
+        raise HTTPException(status_code=404, detail="login session expired or unknown")
+    return login
+
+
+@router.post("/logins")
+def start_login(body: Dict[str, Any]) -> Dict[str, Any]:
+    _reap()
+    label = str(body.get("label") or "").strip()[:60]
+    login = _Login(label)
+    _logins[login.id] = login
+    deadline = time.time() + 15
+    while login.state == "starting" and login.proc.poll() is None and time.time() < deadline:
+        time.sleep(0.2)
+    return login.view()
+
+
+@router.get("/logins/{login_id}")
+def login_status(login_id: str) -> Dict[str, Any]:
+    return _login(login_id).view()
+
+
+@router.post("/logins/{login_id}/code")
+def login_code(login_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    code = str(body.get("code") or "").strip()
+    if not code or len(code) > 600:
+        raise HTTPException(status_code=400, detail="paste the code from the Claude page")
+    login = _login(login_id)
+    login.submit(code)
+    deadline = time.time() + 25
+    while login.state == "verifying" and time.time() < deadline:
+        time.sleep(0.25)
+    return login.view()
+
+
+@router.delete("/logins/{login_id}")
+def login_cancel(login_id: str) -> Dict[str, Any]:
+    login = _logins.pop(login_id, None)
+    if login:
+        login.cancel()
+    return {"ok": True}
