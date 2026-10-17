@@ -189,7 +189,10 @@ def _add(args):
 def _status(_args):
     rows = pool_accounts()
     if not rows:
-        from directsdk_setup import setup_status
+        try:
+            from .directsdk_setup import setup_status
+        except ImportError:
+            from directsdk_setup import setup_status
         probe = setup_status()
         state = ("logged in" + (f" ({probe['plan']})" if probe["plan"] else "")) if probe["logged_in"] else "logged out"
         _print(f"{PLUGIN_ID}: {state} (single Claude Code login; `hermes auth add {PLUGIN_ID}` pools more subscriptions)")
