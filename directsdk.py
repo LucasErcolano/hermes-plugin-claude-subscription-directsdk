@@ -440,6 +440,7 @@ def request_body(kwargs):
 class Request:
     def __init__(self, client):
         self.client, self.process = client, None
+        self.api_key = client.api_key
         self.stream = None
         self.cancelled = threading.Event()
         self.admission = None
@@ -831,11 +832,12 @@ class Client:
     HERMES_SKIP_TRANSPORT_WRAP = True
     HERMES_SKIP_ASYNC_WRAP = True
 
-    def __init__(self, command=None, args=None, env=None, timeout=180, api_key=None, **_):
+    def __init__(self, command=None, args=None, env=None, timeout=180, api_key=None, pooled_auxiliary=False, **_):
         # Hermes snapshots routing metadata from client-shaped objects; this is not a credential.
         # A pooled subscription arrives as ``claude-config-dir:<path>`` (see accounts.py): the row's
         # reference, which core also uses to attribute a failure to the right pool entry.
         self.api_key = api_key if account_dir(api_key) else 'external-process'
+        self._pooled_auxiliary = pooled_auxiliary
         self.base_url = 'process://claude-subscription-directsdk-experimental'
         self.env = dict(env) if env is not None else None
         source_env = self.env if self.env is not None else os.environ
@@ -894,8 +896,10 @@ class Client:
                 self._requests.discard(request)
             raise
 
-    def _register(self):
+    def _register(self, api_key=None):
         request = Request(self)
+        if api_key is not None:
+            request.api_key = api_key  # request-local: cached auxiliary clients can be shared by threads
         with self._lock:
             if self._closed:
                 raise RuntimeError('Claude client is closed')
@@ -903,8 +907,44 @@ class Client:
         return request
 
     def _create(self, request=None, **kwargs):
+        if not self._pooled_auxiliary or kwargs.get('stream'):
+            return self._create_one(request or self._register(), **kwargs)
+        # Core's auto auxiliary recovery cannot infer an external-process pool. Use
+        # its pool here, not a second account registry; explicit main-agent clients
+        # keep their existing core-owned retry path. Never replay a partial stream.
+        from agent.credential_pool import load_pool
+        from agent.agent_runtime_helpers import extract_api_error_context
+        pool = load_pool('claude-subscription-directsdk-experimental')
+        entry = pool.select()
+        attempted = set()
+        while entry is not None and entry.runtime_api_key not in attempted:
+            key = entry.runtime_api_key
+            if not account_dir(key):
+                break
+            attempted.add(key)
+            # The caller's registered request (async cancel reaches it) serves the first attempt.
+            if request is not None and len(attempted) == 1:
+                attempt, request.api_key = request, key
+            else:
+                attempt = self._register(key)
+            try:
+                return self._create_one(attempt, **kwargs)
+            except ClaudeAPIError as exc:
+                error = (exc.body or {}).get('error', {})
+                if exc.status_code != 429 or error.get('type') != 'usage_limit_reached':
+                    raise
+                entry = pool.mark_exhausted_and_rotate(
+                    status_code=429, api_key_hint=key,
+                    error_context=extract_api_error_context(exc))
+                if entry is None or entry.runtime_api_key in attempted:
+                    raise
+        if request is not None:
+            with self._lock:
+                self._requests.discard(request)
+        raise RuntimeError('No available pooled Claude account; ambient login is disabled while the pool is configured')
+
+    def _create_one(self, request, **kwargs):
         # Register before preparing, so a cancel during a slow history build reaches this call.
-        request = request or self._register()
         try:
             body, manifest, names = request_body(kwargs)
             system, frames = prepare_history(kwargs.get('messages', []), names)
@@ -963,7 +1003,7 @@ class Client:
                 if self.env is None:
                     # The serving profile's own token, or none when its claude_config_dir picks the login.
                     apply_profile_credential(env)
-                pooled = account_dir(self.api_key)
+                pooled = account_dir(request.api_key)
                 if pooled:
                     # The pooled login wins over every directory setting: that is what the pool entry means.
                     env['CLAUDE_CONFIG_DIR'] = pooled

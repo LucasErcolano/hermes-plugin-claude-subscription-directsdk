@@ -22,6 +22,13 @@
 - A multiplexed gateway (`gateway.multiplex_profiles: true`) runs each profile's Claude Code on that profile's own login. `CLAUDE_CODE_OAUTH_TOKEN` in a served profile's `.env` now reaches its Claude Code children (read from core's per-turn secret scope; multiplexing never loads it into the process environment). A served profile without a token of its own no longer inherits the gateway process's token, `ANTHROPIC_CUSTOM_HEADERS` or `CLAUDE_CONFIG_DIR`, with or without `claude_config_dir` (Claude Code prefers the token over the selected login directory), so no profile runs on another profile's account. A served profile with neither its own token nor its own config directory is refused with a login error naming both ways to give it one (`claude_config_dir`, or `CLAUDE_CODE_OAUTH_TOKEN` in its `.env`), since Claude Code would otherwise read `~/.claude` under the inherited home. With no secret scope bound, the request and the setup probes fail closed instead of guessing. Single-profile installs and an explicit `Client(env=...)` are unchanged, and the process environment is never modified (#34, #313, thanks @kalfian).
 - `/usage` shows the extra-usage state, usage credits spent, this week's share per surface and the per-model limits beside the plan limits. They were dropped whenever Claude Code answered with `limits`, which current versions always do.
 - `/usage` shows the plan limits with `claude_code_telemetry: false`: the CLI skips its `get_usage` fetch under `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, so the zero-inference usage probe no longer sets that one flag (telemetry and error reporting stay off; a flag the user exported is kept).
+## [0.3.5] - Unreleased
+
+### Fixed
+
+- Compression/auxiliary external-process clients now resolve placeholder credentials through the same account pool as main-agent requests, instead of silently using the ambient Claude login. Non-streaming auxiliary requests retry recognized subscription quota failures on the next pooled login, including `provider: auto`, preserving the quota reset timestamp. Account references are request-local for cached/shared clients; an exhausted configured pool never falls back to the ambient login. Explicit main-agent references and empty-pool single-login behavior are unchanged.
+- No compression cooldown is disabled or cleared: the fix prevents this account-routing failure before it reaches the summary-failure breaker. Other summary failures still surface normally; streaming replay and provider/model fallback behavior are not changed.
+
 ## [0.3.4] - Unreleased
 
 ### Added
