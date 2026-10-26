@@ -22,6 +22,12 @@
 - A multiplexed gateway (`gateway.multiplex_profiles: true`) runs each profile's Claude Code on that profile's own login. `CLAUDE_CODE_OAUTH_TOKEN` in a served profile's `.env` now reaches its Claude Code children (read from core's per-turn secret scope; multiplexing never loads it into the process environment). A served profile without a token of its own no longer inherits the gateway process's token, `ANTHROPIC_CUSTOM_HEADERS` or `CLAUDE_CONFIG_DIR`, with or without `claude_config_dir` (Claude Code prefers the token over the selected login directory), so no profile runs on another profile's account. A served profile with neither its own token nor its own config directory is refused with a login error naming both ways to give it one (`claude_config_dir`, or `CLAUDE_CODE_OAUTH_TOKEN` in its `.env`), since Claude Code would otherwise read `~/.claude` under the inherited home. With no secret scope bound, the request and the setup probes fail closed instead of guessing. Single-profile installs and an explicit `Client(env=...)` are unchanged, and the process environment is never modified (#34, #313, thanks @kalfian).
 - `/usage` shows the extra-usage state, usage credits spent, this week's share per surface and the per-model limits beside the plan limits. They were dropped whenever Claude Code answered with `limits`, which current versions always do.
 - `/usage` shows the plan limits with `claude_code_telemetry: false`: the CLI skips its `get_usage` fetch under `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, so the zero-inference usage probe no longer sets that one flag (telemetry and error reporting stay off; a flag the user exported is kept).
+## [0.3.6] - Unreleased
+
+### Fixed
+
+- The Claude Accounts dashboard tab and the provider's setup probe no longer run `claude auth status` to learn whether a pooled login is signed in; they read the login's credential file. A short-lived `auth status` on an expired access token starts an OAuth refresh and can exit before the rotated, single-use refresh token is saved, so the next real request gets `invalid_grant` and Claude Code blanks the login (CLI 2.1.288-2.1.300; fixed upstream in 2.1.301). The dashboard polled that command every minute per account, which signed pooled accounts out one by one. `auth_status` remains for the one-off `hermes auth` commands and the post-login check. A blanked login is now reported as "login cleared - sign in again" instead of "logged in".
+
 ## [0.3.5] - Unreleased
 
 ### Fixed
