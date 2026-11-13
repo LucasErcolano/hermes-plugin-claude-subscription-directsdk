@@ -6,6 +6,10 @@
 
 Standalone Hermes Agent model-provider plugin: `claude-subscription-directsdk-experimental`, displayed as **Claude Subscription DirectSDK (Experimental)**. It drives the unmodified official Claude Code executable as a request-scoped model client for your Claude Pro/Max subscription. Hermes keeps its normal agent loop, tools, approvals and compaction. Despite the name, the implementation speaks native stream-json directly and does not require the Python Agent SDK package.
 
+## Failure diagnostics
+
+The `claude_directsdk.diagnostics` logger emits bounded JSON warnings before a failed request reaches Hermes' fallback handler. In the gateway these persist in `logs/agent.log` and `logs/errors.log`; search for `DirectSDK diagnostic`. Records include exception type/message, stack locations (no locals), upstream HTTP status and request ID, capture completeness, blocked retries, native exit status, and bounded stderr. Refusals and empty responses are recorded even without exceptions. Known credential values, credential-shaped fields, authorization values and URLs are redacted. Requests, environment dictionaries and normal assistant output are not logged. Error text can still contain provider-supplied context; treat logs as private. Retry and fallback policies are unchanged. Restart the gateway to load plugin updates.
+
 ## Requirements
 
 - Hermes Agent 0.21.4 or newer, or `main` at/after `118984d7a02f` (hermes-agent PR #117451, the core half of #105863). On an older Hermes the plugin fails to load with a clear `Failed to load user provider plugin` warning rather than half-working.

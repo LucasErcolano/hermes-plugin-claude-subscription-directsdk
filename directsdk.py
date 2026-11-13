@@ -944,6 +944,26 @@ class Client:
         raise RuntimeError('No available pooled Claude account; ambient login is disabled while the pool is configured')
 
     def _create_one(self, request, **kwargs):
+        try:
+            return self._create_prepared(request, **kwargs)
+        except Exception as exc:
+            if not getattr(exc, '_directsdk_recorded', False):
+                self._record_failure(exc, kwargs, request.api_key)
+            raise
+
+    def _record_failure(self, exc, kwargs, api_key, **context):
+        try:
+            from .diagnostics import record
+        except ImportError:
+            from diagnostics import record
+        record('request_error', kwargs.get('model'), error=exc,
+               api_key=api_key, env=self.env, **context)
+        try:
+            exc._directsdk_recorded = True
+        except Exception:
+            pass
+
+    def _create_prepared(self, request, **kwargs):
         # Register before preparing, so a cancel during a slow history build reaches this call.
         try:
             body, manifest, names = request_body(kwargs)
@@ -1316,9 +1336,21 @@ class Client:
                     dict(tc, index=len(tool_stream.slots) + i) for i, tc in enumerate(c for c in calls if not tool_stream.streamed(c['id']))]
                 chunk = self._chunk(kwargs['model'], {'content': None, 'tool_calls': late or None, 'reasoning_details': [carrier], **({'refusal': message['refusal']} if refused else {})}, finish, normalized_usage)
                 chunk._response = response
+                if refused or (not text and not calls):
+                    try:
+                        from .diagnostics import record
+                    except ImportError:
+                        from diagnostics import record
+                    record('refusal' if refused else 'empty_response', kwargs['model'],
+                           api_key=request.api_key, env=self.env, admission=admission,
+                           process=p, detail=message.get('refusal'))
                 # Fast return removes these per-request files while native drains: safe on POSIX;
                 # ignore_cleanup_errors already tolerates files still held open on Windows.
                 yield chunk
+        except Exception as exc:
+            self._record_failure(exc, kwargs, request.api_key,
+                                 admission=request.admission, process=p, stderr=native_stderr)
+            raise
         finally:
             try:
                 request.cancel()

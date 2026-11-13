@@ -17,7 +17,6 @@ EXPECTED = {
     'claude-opus-4-8[1m]': 1_000_000,
     'claude-fable-5-2[1m]': 1_000_000,
     'claude-fable-5-1[1m]': 1_000_000,
-    'claude-fable-5-2[1m]': 1_000_000,
 }
 # Pinned like any route (window, thinking, capabilities) but granted per organization: never in the
 # static fallback picker, listed only when the account's own picker offers it (test_directsdk_setup).
