@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.1] - Unreleased (Lermex fork)
+
+The fork's account pool (0.3.4–0.3.11 below: pooled subscriptions, the Claude Accounts tab, per-family benches, account controls) replayed onto upstream 0.4.0.
+
+### Fixed
+
+- Pool rotation keeps upstream's request registration: the caller's registered request serves the first attempt (an async cancel reaches it) and every rotated attempt registers its own, streaming included.
+- A pooled login is applied after the profile credential and before the orphaned refresh-lock reap, so the reap and the extra-usage check look at the account that serves the turn.
+- Errors keep upstream's request id and the pool's plan-limit body together.
+- `/usage` extra-usage amounts are divided by `decimal_places` (minor units), as the dashboard already did.
+- The failure diagnostic reads the native exit code without reaping it: `poll()` there reaped an exited launcher, so cancellation could no longer signal its process group and a descendant holding native's stdout kept the request waiting (20 s in `test_exited_launcher_with_inherited_stdout_is_cleaned_on_timeout`).
+
 ## [0.4.0] - Unreleased
 
 ### Added

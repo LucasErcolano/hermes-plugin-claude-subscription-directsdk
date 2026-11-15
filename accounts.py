@@ -218,7 +218,7 @@ def refresh_token(config_dir, command=None, env=None, timeout=90):
         client = Client(command=command, env=child, timeout=timeout, api_key=account_ref(config_dir))
         client.expects_refusal = True  # not a failure worth a diagnostic
         try:
-            client._create_prepared(client.api_key, model="haiku", max_tokens=16, messages=[{"role": "user", "content": "ok"}])
+            client._create_prepared(client._register(client.api_key), model="haiku", max_tokens=16, messages=[{"role": "user", "content": "ok"}])
         except ClaudeCodeLoggedOut:
             return {"ok": False, "error": "sign-in expired — sign in again"}
         except ClaudeCodeMissing:

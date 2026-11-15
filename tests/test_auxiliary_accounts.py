@@ -8,6 +8,11 @@ import accounts
 from conftest import PLUGIN_NAME
 
 
+
+def _by_key(attempt):
+    """Tests script one attempt per account key; the client hands each attempt a registered request."""
+    return lambda request, **kwargs: attempt(request.api_key, **kwargs)
+
 def add_accounts(tmp_path):
     from agent.credential_pool import AUTH_TYPE_API_KEY, SOURCE_MANUAL, PooledCredential, load_pool
     pool = load_pool(PLUGIN_NAME)
@@ -60,7 +65,7 @@ def test_exhausted_pool_client_uses_account_that_reopens(profile, tmp_path, monk
                                       error_context={'reason': 'usage_limit_reached', 'reset_at': 4102444800})
     client = profile.create_client(api_key=PLUGIN_NAME)
     used = []
-    monkeypatch.setattr(client, '_create_once', lambda key, **kw: used.append(key) or 'ok')
+    monkeypatch.setattr(client, '_create_one', _by_key(lambda key, **kw: used.append(key) or 'ok'))
     # The window reopens after the client was built: the pool selects an account again.
     import agent.credential_pool as credential_pool
     reopened = pool.entries()[1]
@@ -178,7 +183,7 @@ def test_cached_aux_client_reselects_and_preserves_quota_reset(profile, tmp_path
                              {'error': {'type': 'usage_limit_reached', 'resets_at': reset}})
         return 'summary'
 
-    monkeypatch.setattr(client, '_create_once', attempt)
+    monkeypatch.setattr(client, '_create_one', _by_key(attempt))
     try:
         for _ in range(2):
             result = asyncio.run(client._acreate(model='sonnet')) if async_mode else client.create(model='sonnet')
@@ -206,7 +211,7 @@ def test_non_quota_errors_do_not_rotate(profile, tmp_path, monkeypatch, status, 
         calls.append(key)
         raise error
 
-    monkeypatch.setattr(client, '_create_once', attempt)
+    monkeypatch.setattr(client, '_create_one', _by_key(attempt))
     try:
         with pytest.raises(error_type) as caught:
             client.create(model='sonnet')
@@ -229,7 +234,7 @@ def test_all_quota_limited_accounts_are_tried_once(profile, tmp_path, monkeypatc
         raise error_type('quota exhausted', 429,
                          {'error': {'type': 'usage_limit_reached', 'resets_at': 4102444800}})
 
-    monkeypatch.setattr(client, '_create_once', attempt)
+    monkeypatch.setattr(client, '_create_one', _by_key(attempt))
     try:
         with pytest.raises(error_type):
             client.create(model='sonnet')

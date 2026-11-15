@@ -9,6 +9,11 @@ import limits
 from conftest import PLUGIN_NAME
 
 
+def _by_key(attempt):
+    """Tests script one attempt per account key; the client hands each attempt a registered request."""
+    return lambda request, **kwargs: attempt(request.api_key, **kwargs)
+
+
 @pytest.mark.parametrize('claim,message,model,scope', [
     ('five_hour', '', 'claude-fable-5-2[1m]', 'all'),
     ('seven_day', '', 'claude-opus-5-5', 'all'),
@@ -23,6 +28,7 @@ from conftest import PLUGIN_NAME
     (None, "You've hit your Fable limit · resets Oct 23, 6pm (UTC)", 'claude-fable-5-2[1m]', 'fable'),
     (None, "This request would exceed your account's monthly spend limit.", 'claude-fable-5-2[1m]', 'all'),
 ])
+
 def test_scope_for(claim, message, model, scope):
     assert limits.scope_for(claim, message, model) == scope
 
@@ -77,7 +83,7 @@ def test_fable_limit_benches_fable_only_and_falls_back_without_benching_accounts
             raise _limit(error_type, 'fable')
         return 'opus answer'
 
-    monkeypatch.setattr(client, '_create_once', attempt)
+    monkeypatch.setattr(client, '_create_one', _by_key(attempt))
     try:
         with pytest.raises(error_type) as raised:
             client.create(model='claude-fable-5-2[1m]')
@@ -114,7 +120,7 @@ def test_account_wide_limit_benches_the_account_for_every_model(profile, tmp_pat
             raise _limit(error_type, limits.ALL)
         return 'from b'
 
-    monkeypatch.setattr(client, '_create_once', attempt)
+    monkeypatch.setattr(client, '_create_one', _by_key(attempt))
     try:
         assert client.create(model='claude-fable-5-2[1m]') == 'from b'
         assert calls == [ref['a'], ref['b']]
@@ -139,7 +145,7 @@ def test_fable_limit_on_one_account_rotates_to_the_other(profile, tmp_path, monk
             raise _limit(error_type, 'fable')
         return 'fable from b'
 
-    monkeypatch.setattr(client, '_create_once', attempt)
+    monkeypatch.setattr(client, '_create_one', _by_key(attempt))
     try:
         assert client.create(model='claude-fable-5-2[1m]') == 'fable from b'
         assert client.create(model='claude-fable-5-2[1m]') == 'fable from b'
@@ -172,7 +178,7 @@ def test_streaming_rotates_before_output_only(profile, tmp_path, monkeypatch):
         def close(self):
             self.closed = True
 
-    monkeypatch.setattr(client, '_create_once', lambda key, **kw: Fake(key))
+    monkeypatch.setattr(client, '_create_one', _by_key(lambda key, **kw: Fake(key)))
     try:
         assert list(client.create(model='claude-fable-5-2[1m]', stream=True)) == ['chunk-from-b']
     finally:

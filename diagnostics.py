@@ -42,7 +42,9 @@ def record(kind, model, *, error=None, api_key=None, env=None, admission=None,
             capture = getattr(admission, 'capture', None)
             fields['capture_complete'] = getattr(capture, 'complete', None)
         if process is not None:
-            fields['native_exit_code'] = process.poll()
+            # returncode, never poll(): reaping an exited launcher would stop cancellation from signalling
+            # its process group, leaving descendants that still hold native's pipes (process_tree.unreaped).
+            fields['native_exit_code'] = process.returncode
         if stderr:
             fields['native_stderr'] = scrub(''.join(list(stderr)[-40:]), secrets)
         if detail:
