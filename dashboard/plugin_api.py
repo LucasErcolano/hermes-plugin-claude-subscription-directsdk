@@ -31,6 +31,7 @@ PLUGIN_ID = "claude-subscription-directsdk-experimental"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 USAGE_TTL = 60.0
 STATUS_TTL = 120.0
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
 _usage_cache: Dict[str, tuple] = {}
 _status_cache: Dict[str, tuple] = {}
@@ -138,7 +139,7 @@ def _fetch_usage(config_dir: str) -> Dict[str, Any]:
                "Accept": "application/json", "User-Agent": "claude-code/2.1.0"}
     try:
         with httpx.Client(timeout=8.0) as client:
-            response = client.get(provider.USAGE_URL, headers=headers)
+            response = client.get(USAGE_URL, headers=headers)
     except httpx.HTTPError:
         return _unavailable("could not reach the usage API")
     if response.status_code in (401, 403):

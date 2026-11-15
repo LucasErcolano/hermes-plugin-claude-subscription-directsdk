@@ -50,7 +50,7 @@ def api(monkeypatch):
     spec = importlib.util.spec_from_file_location('plugin_api_controls', Path(__file__).resolve().parents[1] / 'dashboard' / 'plugin_api.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    provider = SimpleNamespace(USAGE_URL='https://usage.invalid', usage_windows=lambda payload: ([], []))
+    provider = SimpleNamespace(usage_windows=lambda payload: ([], []))
     monkeypatch.setattr(module, '_module', lambda name: {'accounts': accounts, 'limits': limits, '__init__': provider}[name])
     return module
 
