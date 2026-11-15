@@ -38,8 +38,56 @@ def test_nonempty_exhausted_pool_never_uses_ambient_login(profile, tmp_path):
     for entry in pool.entries():
         pool.mark_exhausted_and_rotate(status_code=429, api_key_hint=entry.runtime_api_key,
                                       error_context={'reason': 'usage_limit_reached', 'reset_at': 4102444800})
-    with pytest.raises(RuntimeError, match='No available pooled Claude account'):
-        profile.create_client(api_key=PLUGIN_NAME)
+    # Construction succeeds (Hermes builds the agent before any request, and an exception here
+    # strands the turn before fallback_model is consulted); the request fails as a plan limit.
+    client = profile.create_client(api_key=PLUGIN_NAME)
+    error_type = sys.modules[type(client).__module__].ClaudeAPIError
+    try:
+        assert client.api_key == 'external-process'
+        with pytest.raises(error_type, match='No available pooled Claude account') as raised:
+            client.create(model='sonnet', messages=[{'role': 'user', 'content': 'hi'}])
+        assert raised.value.status_code == 429
+        assert raised.value.body['error']['type'] == 'usage_limit_reached'
+        assert raised.value.body['error']['resets_at'] == 4102444800
+    finally:
+        client.close()
+
+
+def test_exhausted_pool_client_uses_account_that_reopens(profile, tmp_path, monkeypatch):
+    pool = add_accounts(tmp_path)
+    for entry in pool.entries():
+        pool.mark_exhausted_and_rotate(status_code=429, api_key_hint=entry.runtime_api_key,
+                                      error_context={'reason': 'usage_limit_reached', 'reset_at': 4102444800})
+    client = profile.create_client(api_key=PLUGIN_NAME)
+    used = []
+    monkeypatch.setattr(client, '_create_once', lambda key, **kw: used.append(key) or 'ok')
+    # The window reopens after the client was built: the pool selects an account again.
+    import agent.credential_pool as credential_pool
+    reopened = pool.entries()[1]
+    monkeypatch.setattr(credential_pool, 'load_pool',
+                        lambda name: type('Pool', (), {'select': lambda self: reopened})())
+    try:
+        assert client.create(model='sonnet') == 'ok'
+        assert used == [reopened.runtime_api_key]
+        assert client.api_key == reopened.runtime_api_key
+    finally:
+        client.close()
+
+
+def test_agent_builds_with_exhausted_pool(profile, tmp_path, monkeypatch):
+    # The real core construction path: before the fix this raised
+    # "Failed to initialize OpenAI client: ... unexpected keyword argument 'command'".
+    from run_agent import AIAgent
+    pool = add_accounts(tmp_path)
+    for entry in pool.entries():
+        pool.mark_exhausted_and_rotate(status_code=429, api_key_hint=entry.runtime_api_key,
+                                      error_context={'reason': 'usage_limit_reached', 'reset_at': 4102444800})
+    monkeypatch.setenv('CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND', sys.executable)
+    agent = AIAgent(model='sonnet', provider=PLUGIN_NAME, api_key=PLUGIN_NAME,
+                    base_url='process://claude-subscription-directsdk-experimental',
+                    quiet_mode=True, skip_context_files=True, skip_memory=True, enabled_toolsets=[])
+    assert agent.client is not None
+    assert type(agent.client).__name__ == 'Client'
 
 
 @pytest.mark.parametrize('provider_mode', ['explicit', 'auto'])
@@ -188,7 +236,7 @@ def test_all_quota_limited_accounts_are_tried_once(profile, tmp_path, monkeypatc
         assert calls == [accounts.account_ref(tmp_path / name) for name in ('limited', 'available')]
         assert all(e.last_error_reset_at == 4102444800 for e in load_pool(PLUGIN_NAME).entries())
         # Reusing a cached client cannot escape to an unpooled/default login.
-        with pytest.raises(RuntimeError, match='No available pooled Claude account'):
+        with pytest.raises(error_type, match='No available pooled Claude account'):
             client.create(model='sonnet')
         assert len(calls) == 2
     finally:

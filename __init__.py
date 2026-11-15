@@ -163,7 +163,13 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
             if pool.has_credentials():
                 entry = pool.select()
                 if entry is None or not account_dir(entry.runtime_api_key):
-                    raise RuntimeError('No available pooled Claude account; ambient login is disabled while the pool is configured')
+                    # Never fall back to the ambient login. Raising here would happen while Hermes is
+                    # still constructing the agent: core then retries an OpenAI SDK client with these
+                    # kwargs (TypeError on ``command``) and the configured fallback provider is never
+                    # consulted, because fallback only runs on a failed request. Defer the failure to
+                    # the first request as the plan-limit 429 a single exhausted account produces, so
+                    # core's normal rate-limit path (rotation, then fallback_model) handles it.
+                    return Client(**client_kwargs, pool_exhausted_until=pool.next_available_at() or False)
                 client_kwargs['api_key'] = entry.runtime_api_key
                 client_kwargs['pooled_auxiliary'] = True
         return Client(**client_kwargs)

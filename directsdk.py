@@ -832,12 +832,16 @@ class Client:
     HERMES_SKIP_TRANSPORT_WRAP = True
     HERMES_SKIP_ASYNC_WRAP = True
 
-    def __init__(self, command=None, args=None, env=None, timeout=180, api_key=None, pooled_auxiliary=False, **_):
+    def __init__(self, command=None, args=None, env=None, timeout=180, api_key=None, pooled_auxiliary=False,
+                 pool_exhausted_until=None, **_):
         # Hermes snapshots routing metadata from client-shaped objects; this is not a credential.
         # A pooled subscription arrives as ``claude-config-dir:<path>`` (see accounts.py): the row's
         # reference, which core also uses to attribute a failure to the right pool entry.
         self.api_key = api_key if account_dir(api_key) else 'external-process'
         self._pooled_auxiliary = pooled_auxiliary
+        # Not None: every pooled account was benched when this client was built (False = no reset
+        # time known). Requests then fail as a plan-limit 429 instead of using any login.
+        self._pool_exhausted_until = pool_exhausted_until
         self.base_url = 'process://claude-subscription-directsdk-experimental'
         self.env = dict(env) if env is not None else None
         source_env = self.env if self.env is not None else os.environ
@@ -906,7 +910,27 @@ class Client:
             self._requests.add(request)
         return request
 
+    def _pool_exhausted_error(self):
+        error = {'type': 'usage_limit_reached',
+                 'message': 'No available pooled Claude account: every subscription in the pool is at its usage limit'}
+        if self._pool_exhausted_until:
+            error['resets_at'] = int(self._pool_exhausted_until)
+        return ClaudeAPIError(error['message'], status_code=429, body={'error': error})
+
     def _create(self, request=None, **kwargs):
+        if self._pool_exhausted_until is not None:
+            # Built while the pool was empty. If an account has reopened since, use it (the same
+            # pool, never ambient login); otherwise fail as a plan limit so core falls back.
+            from agent.credential_pool import load_pool
+            entry = load_pool('claude-subscription-directsdk-experimental').select()
+            if entry is None or not account_dir(entry.runtime_api_key):
+                if request is not None:
+                    with self._lock:
+                        self._requests.discard(request)
+                raise self._pool_exhausted_error()
+            self.api_key, self._pool_exhausted_until, self._pooled_auxiliary = entry.runtime_api_key, None, True
+            if request is not None:
+                request.api_key = self.api_key
         if not self._pooled_auxiliary or kwargs.get('stream'):
             return self._create_one(request or self._register(), **kwargs)
         # Core's auto auxiliary recovery cannot infer an external-process pool. Use
@@ -941,7 +965,7 @@ class Client:
         if request is not None:
             with self._lock:
                 self._requests.discard(request)
-        raise RuntimeError('No available pooled Claude account; ambient login is disabled while the pool is configured')
+        raise self._pool_exhausted_error()
 
     def _create_one(self, request, **kwargs):
         try:
