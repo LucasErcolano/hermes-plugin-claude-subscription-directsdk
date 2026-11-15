@@ -1,5 +1,11 @@
 # Claude Subscription DirectSDK (Experimental) — Hermes plugin
 
+## Local fork: scoped subscription cooldowns
+
+Fable-family limits are stored per account in `plugin-data/claude-subscription-directsdk-experimental/model_benches.json`; account-wide limits remain in Hermes' credential pool. The upstream representative-claim header or an explicitly named family determines the scope. Unknown claims and unlabelled quota messages remain account-wide. Old global benches are not guessed into a category.
+
+When all accounts are Fable-benched, the provider classification hook permits fallback to another Claude model without marking those accounts globally exhausted. Hermes' existing ordered `fallback_providers` list can mix this provider (e.g. Opus) with OpenAI Codex and other providers. This patch does not change that list. Stream retries only occur before output; reset times expire scoped benches automatically. Gateway restart is required to load changes.
+
 > Part of [Hermes Official Plugins](../README.md), Nous Research's official plugins for Hermes Agent. Formerly [`NousResearch/hermes-plugin-claude-subscription-directsdk`](https://github.com/NousResearch/hermes-plugin-claude-subscription-directsdk), which is archived; this directory carries its full history.
 
 ![Claude Subscription DirectSDK — a Hermes model-provider plugin: Hermes → claude CLI → stream-json, on your Claude Pro/Max subscription](assets/hero-technohellenic.png)

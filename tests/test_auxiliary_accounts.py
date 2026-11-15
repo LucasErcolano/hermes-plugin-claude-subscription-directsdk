@@ -64,8 +64,8 @@ def test_exhausted_pool_client_uses_account_that_reopens(profile, tmp_path, monk
     # The window reopens after the client was built: the pool selects an account again.
     import agent.credential_pool as credential_pool
     reopened = pool.entries()[1]
-    monkeypatch.setattr(credential_pool, 'load_pool',
-                        lambda name: type('Pool', (), {'select': lambda self: reopened})())
+    monkeypatch.setattr(credential_pool.CredentialPool, 'select', lambda self, **_: reopened)
+    monkeypatch.setattr(credential_pool.CredentialPool, '_available_entries', lambda self, **_: ([reopened], []))
     try:
         assert client.create(model='sonnet') == 'ok'
         assert used == [reopened.runtime_api_key]

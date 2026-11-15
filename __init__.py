@@ -258,6 +258,14 @@ def classify_api_error(error, **_):
     # Matched by class name: the plugin can load as a package or as top-level modules, so the class may be either copy.
     if type(error).__name__ == 'RequestRejected':
         return {'reason': 'format_error', 'retryable': False, 'should_fallback': True}
+    if getattr(error, 'scope_exhausted', False):
+        # One model family is at its own limit on every account; the accounts are healthy for
+        # other models. Fall back to the next chain entry without rotating or benching anything.
+        context = {'upstream_provider': f"Anthropic {error.limit_scope} limit"}
+        if getattr(error, 'resets_at', None):
+            context['reset_at'] = error.resets_at
+        return {'reason': 'upstream_rate_limit', 'should_fallback': True, 'should_rotate_credential': False,
+                'retryable': False, 'error_context': context}
     return None
 
 

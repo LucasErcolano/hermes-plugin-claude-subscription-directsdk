@@ -703,6 +703,7 @@ class Admission:
         self.request_id = None
         self.status = None
         self.reset_epoch = None  # anthropic-ratelimit-unified-reset of a 429: when the binding window reopens
+        self.limit_claim = None  # anthropic-ratelimit-unified-representative-claim of a 429: which limit bound
         self.failure = None
         self.unrestored = None
         self.capture = Capture()
@@ -902,6 +903,7 @@ class Handler(BaseHTTPRequestHandler):
             gate.status = response.status
             if response.status == 429:
                 reset = response.getheader('anthropic-ratelimit-unified-reset') or response.getheader('retry-after')
+                gate.limit_claim = response.getheader('anthropic-ratelimit-unified-representative-claim')
                 try:
                     value = float(reset)
                     gate.reset_epoch = value if value > 1_000_000_000 else time.time() + value

@@ -25,13 +25,21 @@ collect_ignore = ["__init__.py", "directsdk.py", "directsdk_setup.py", "admissio
                   "inert_mcp.py", "process_tree.py", "concurrency.py", "evals"]
 
 
+@pytest.fixture(autouse=True)
+def _isolated_hermes_home(tmp_path_factory, monkeypatch):
+    """Every test gets its own HERMES_HOME: clients consult the credential pool and the
+    model-bench store on each request, and neither may ever touch a real installation."""
+    if not os.environ.get("HERMES_HOME", "").startswith(str(tmp_path_factory.getbasetemp())):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path_factory.mktemp("isolated-home")))
+
+
 @pytest.fixture
 def profile(tmp_path, monkeypatch):
     import providers
 
     home = tmp_path / "hermes-home"
     installed = home / "plugins" / PLUGIN_NAME
-    shutil.copytree(REPO_ROOT, installed, ignore=shutil.ignore_patterns(".git", "tests", "evals", "__pycache__"))
+    shutil.copytree(REPO_ROOT, installed, ignore=shutil.ignore_patterns(".git", ".venv", "tests", "evals", "__pycache__", "assets"))
     monkeypatch.setenv("HERMES_HOME", str(home))
     (home / "config.yaml").write_text("plugins:\n  enabled: []\n", encoding="utf-8")
     # A machine with Claude Code installed must not leak it into offline tests.

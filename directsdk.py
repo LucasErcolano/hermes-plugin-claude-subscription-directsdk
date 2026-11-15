@@ -35,6 +35,7 @@ try:
         apply_traffic_policy, check_extra_usage, drop_api_credentials, egress_env, max_concurrent, observe_rate_limit,
         reap_orphaned_refresh_lock, relay, resolve_upstream, Upstream)
     from .accounts import account_dir, reset_epoch_from_message
+    from . import limits
 except ImportError:
     import concurrency
     from model_catalog import accepts_thinking_disable, native_model, supports_adaptive_thinking
@@ -44,6 +45,7 @@ except ImportError:
         apply_traffic_policy, check_extra_usage, drop_api_credentials, egress_env, max_concurrent, observe_rate_limit,
         reap_orphaned_refresh_lock, relay, resolve_upstream, Upstream)
     from accounts import account_dir, reset_epoch_from_message
+    import limits
 
 
 logger = logging.getLogger(__name__)
@@ -58,6 +60,9 @@ class ClaudeCodeMissing(RuntimeError):
 def _request_id(value):
     """Only a bounded opaque ID may enter diagnostics, never arbitrary header contents."""
     return value if isinstance(value, str) and re.fullmatch(r'req_[A-Za-z0-9_-]{1,124}', value) else None
+
+
+POOL_PROVIDER = 'claude-subscription-directsdk-experimental'
 
 
 class ClaudeAPIError(RuntimeError):
@@ -710,6 +715,54 @@ class Stream:
         self.close()
 
 
+class RotatingStream:
+    """A streaming request that moves to the next account when a subscription limit answers
+    before any output. Nothing is replayed once a chunk has been yielded."""
+
+    def __init__(self, client, kwargs, key, attempted, request=None):
+        self.client, self.kwargs, self.key, self.attempted = client, kwargs, key, attempted
+        self.yielded = False
+        # Eager, like a plain stream: request validation errors surface from create() itself.
+        attempted.add(key)
+        if request is not None:
+            request.api_key = key  # the caller's registered request (async cancel reaches it)
+        self.inner = client._create_one(request or client._register(key), **kwargs)
+
+    @property
+    def request(self):
+        return getattr(self.inner, 'request', None)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while True:
+            if self.inner is None:
+                self.attempted.add(self.key)
+                self.inner = self.client._create_one(self.client._register(self.key), **self.kwargs)
+            try:
+                chunk = next(self.inner)
+            except ClaudeAPIError as exc:
+                if self.yielded:
+                    raise
+                self.close()
+                self.key = self.client._after_limit(exc, self.key, self.kwargs.get('model'), self.attempted)
+                continue
+            self.yielded = True
+            return chunk
+
+    def close(self):
+        inner, self.inner = self.inner, None
+        if inner is not None and callable(getattr(inner, 'close', None)):
+            inner.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
 class AsyncStream:
     def __init__(self, stream):
         self.stream = stream
@@ -922,7 +975,7 @@ class Client:
             # Built while the pool was empty. If an account has reopened since, use it (the same
             # pool, never ambient login); otherwise fail as a plan limit so core falls back.
             from agent.credential_pool import load_pool
-            entry = load_pool('claude-subscription-directsdk-experimental').select()
+            entry = load_pool(POOL_PROVIDER).select()
             if entry is None or not account_dir(entry.runtime_api_key):
                 if request is not None:
                     with self._lock:
@@ -931,20 +984,22 @@ class Client:
             self.api_key, self._pool_exhausted_until, self._pooled_auxiliary = entry.runtime_api_key, None, True
             if request is not None:
                 request.api_key = self.api_key
-        if not self._pooled_auxiliary or kwargs.get('stream'):
-            return self._create_one(request or self._register(), **kwargs)
-        # Core's auto auxiliary recovery cannot infer an external-process pool. Use
-        # its pool here, not a second account registry; explicit main-agent clients
-        # keep their existing core-owned retry path. Never replay a partial stream.
-        from agent.credential_pool import load_pool
-        from agent.agent_runtime_helpers import extract_api_error_context
-        pool = load_pool('claude-subscription-directsdk-experimental')
-        entry = pool.select()
+        model = kwargs.get('model')
         attempted = set()
-        while entry is not None and entry.runtime_api_key not in attempted:
-            key = entry.runtime_api_key
-            if not account_dir(key):
-                break
+        try:
+            key = self._serving_key(model, attempted)
+        except BaseException:
+            if request is not None:
+                with self._lock:
+                    self._requests.discard(request)
+            raise
+        if kwargs.get('stream'):
+            while True:
+                try:
+                    return RotatingStream(self, kwargs, key, attempted, request if not attempted else None)
+                except ClaudeAPIError as exc:
+                    key = self._after_limit(exc, key, model, attempted)
+        while True:
             attempted.add(key)
             # The caller's registered request (async cancel reaches it) serves the first attempt.
             if request is not None and len(attempted) == 1:
@@ -954,18 +1009,85 @@ class Client:
             try:
                 return self._create_one(attempt, **kwargs)
             except ClaudeAPIError as exc:
-                error = (exc.body or {}).get('error', {})
-                if exc.status_code != 429 or error.get('type') != 'usage_limit_reached':
-                    raise
-                entry = pool.mark_exhausted_and_rotate(
-                    status_code=429, api_key_hint=key,
-                    error_context=extract_api_error_context(exc))
-                if entry is None or entry.runtime_api_key in attempted:
-                    raise
-        if request is not None:
-            with self._lock:
-                self._requests.discard(request)
-        raise self._pool_exhausted_error()
+                key = self._after_limit(exc, key, model, attempted)
+
+    def _pool_keys(self, model):
+        """Pooled account refs core considers available for *model*, in pool order; ``None`` when
+        no pool is configured (single ambient login)."""
+        from agent.credential_pool import load_pool
+        pool = load_pool(POOL_PROVIDER)
+        if not pool.has_credentials():
+            return None
+        if account_dir(self.api_key) and not any(e.runtime_api_key == self.api_key for e in pool.entries()):
+            return None  # explicitly pinned unregistered client; do not borrow unrelated logins
+        # Core's own pick first (its rotation strategy), then every other account it has available.
+        first = pool.select(model=model) if model else pool.select()
+        with pool._lock:
+            available, _pending = pool._available_entries(refresh=False, model=model)
+        keys = [entry.runtime_api_key for entry in ([first] if first else []) + list(available)]
+        return list(dict.fromkeys(k for k in keys if account_dir(k)))
+
+    def _serving_key(self, model, attempted):
+        """The account to send *model* to: this client's own account first, then any other pooled
+        account core still has available, skipping accounts benched for the model's family.
+        Raises the model-scoped exhaustion error when none can serve it."""
+        # A registered account must pass core's account-wide cooldown check even when this
+        # client was cached before the cooldown. Explicit unregistered clients remain pinned.
+        pooled = self._pool_keys(model) if account_dir(self.api_key) or self._pooled_auxiliary else None
+        own = [self.api_key] if pooled is None or (not self._pooled_auxiliary and self.api_key in pooled) else []
+        candidates = own + [k for k in (pooled or []) if k not in own]
+        soonest = None
+        for key in candidates:
+            until = limits.benched_until(key, model)
+            if until is None and key not in attempted:
+                return key
+            if until is not None:
+                soonest = until if soonest is None else min(soonest, until)
+        if soonest is None:
+            raise self._pool_exhausted_error()  # nothing benched for this family: account-wide exhaustion
+        raise self._scope_exhausted_error(model, soonest)
+
+    def _after_limit(self, exc, key, model, attempted):
+        """Handle a subscription-limit 429 from *key*: bench it at the right scope and return the
+        next account to try. Re-raises when the error is not a limit or nothing is left."""
+        scope = getattr(exc, 'limit_scope', None)
+        if scope is None and ((exc.body or {}).get('error') or {}).get('type') == 'usage_limit_reached':
+            scope = limits.ALL  # a plan limit nobody scoped: account-wide, as before scoping existed
+        if exc.status_code != 429 or not scope:
+            raise exc
+        until = ((exc.body or {}).get('error') or {}).get('resets_at')
+        if scope == limits.ALL:
+            if not account_dir(key):
+                raise exc  # single ambient login: core's own 429 handling, as before
+            from agent.credential_pool import load_pool
+            from agent.agent_runtime_helpers import extract_api_error_context
+            load_pool(POOL_PROVIDER).mark_exhausted_and_rotate(
+                status_code=429, api_key_hint=key, error_context=extract_api_error_context(exc))
+        else:
+            limits.bench(key, scope, until)
+        try:
+            return self._serving_key(model, attempted)
+        except ClaudeAPIError:
+            if scope == limits.ALL:
+                raise exc  # core marks it and walks the fallback chain
+            raise
+
+    def _scope_exhausted_error(self, model, until=None):
+        """Every account is benched for *model*'s family, while the accounts themselves are fine.
+
+        The provider profile's ``classify_api_error`` turns this into core's "upstream rate limit"
+        verdict: fall back to the next model, do not rotate or bench the credential (core benching
+        here would take every other model on these accounts down too)."""
+        fam = limits.family(model)
+        message = f'Every Claude account is at its {fam} limit; other models on the same accounts are unaffected'
+        error = {'type': 'rate_limit_error', 'message': message, 'scope': fam}
+        if until:
+            error['resets_at'] = int(until)
+        exc = ClaudeAPIError(message, status_code=429, body={'error': error})
+        exc.limit_scope = fam
+        exc.scope_exhausted = True
+        exc.resets_at = int(until) if until else None
+        return exc
 
     def _create_one(self, request, **kwargs):
         try:
@@ -1260,6 +1382,8 @@ class Client:
                     if admission.status != 200 or not admission.capture.complete:
                         # Native's last error is the admission denial; name the first attempt's outcome so reports are diagnosable.
                         first = f'first upstream attempt: status {admission.status}, capture ' + ('complete' if admission.capture.complete else 'incomplete') + (f', relay failure {admission.failure}' if admission.failure else '') + f', native retries denied: {admission.denied}'
+                        if admission.limit_claim:
+                            first += f', limit claim {admission.limit_claim}'
                         if admission.error_text():
                             first += ', upstream said: ' + admission.error_text()[:500]
                         # The first attempt's real HTTP status; a 200 cut short or a relay failure has none.
@@ -1270,8 +1394,14 @@ class Client:
                             body = native_limit_body(native_error or admission.error_text()) or {'error': {'type': 'rate_limit_error', 'message': admission.error_text()[:500]}}
                             if admission.reset_epoch is not None:
                                 body['error']['resets_at'] = admission.reset_epoch
-                        raise ClaudeAPIError(f'Incomplete upstream response ({first})' + (': ' + native_error if native_error else ''),
+                        exc = ClaudeAPIError(f'Incomplete upstream response ({first})' + (': ' + native_error if native_error else ''),
                                              status, body, request_id=admission.request_id)
+                        limit_text = native_error or admission.error_text()
+                        if status == 429 and (admission.limit_claim or body['error'].get('type') == 'usage_limit_reached'
+                                              or 'spend limit' in limit_text.lower()):
+                            # A subscription limit, not a transient request-rate throttle.
+                            exc.limit_scope = limits.scope_for(admission.limit_claim, limit_text, kwargs['model'])
+                        raise exc
                     assistants = [admission.capture.message]
                     stopped = True
                 native_failure_handled = admission.denied or (admission.used and assistants[0].get('stop_reason') == 'refusal')
@@ -1283,8 +1413,11 @@ class Client:
                         home = env.get('HOME') or env.get('USERPROFILE')
                         login = env.get('CLAUDE_CONFIG_DIR') or str((Path(home) if home else Path.home()) / '.claude')
                         raise ClaudeCodeLoggedOut(f'{LOGGED_OUT_HINT} (native: {native_error}; cli: {resolved[0]}; login: {login}){_stderr_tail(native_stderr)}')
-                    raise ClaudeAPIError('Native API error: ' + native_error, NATIVE_ERROR_STATUS.get(str(native_error_code)),
+                    exc = ClaudeAPIError('Native API error: ' + native_error, NATIVE_ERROR_STATUS.get(str(native_error_code)),
                                          native_limit_body(native_error) if native_error_code == 'rate_limit' else None)
+                    if native_error_code == 'rate_limit' and (exc.body or 'spend limit' in native_error.lower()):
+                        exc.limit_scope = limits.scope_for(None, native_error, kwargs['model'])
+                    raise exc
                 if len(results) != 1 or not assistants or not stopped:
                     raise RuntimeError('Incomplete native response: assistant, message_stop and one result required')
                 final = results[0]
