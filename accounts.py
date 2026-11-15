@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -162,6 +163,82 @@ def any_pooled_login(command=None, env=None):
         if status["logged_in"]:
             return status
     return None
+
+
+# --- Refreshing an expired access token, through Claude Code itself ---------------------------------
+
+REFRESH_REFUSAL = 'HERMES_TOKEN_REFRESH_ONLY'
+
+
+def token_expired(config_dir, margin=60):
+    """Whether the login's access token is past (or within *margin* seconds of) its expiry."""
+    creds = read_oauth_credentials(config_dir)
+    expires = creds.get("expiresAt") if creds else None
+    return bool(creds) and isinstance(expires, (int, float)) and expires / 1000 < time.time() + margin
+
+
+def refresh_token(config_dir, command=None, env=None, timeout=90):
+    """Have Claude Code renew *config_dir*'s access token, without using the subscription.
+
+    Claude Code owns the grant (its refresh tokens are single-use), so the renewal has to be
+    its own. A real request makes it renew and save the token before it sends anything; this
+    runs one whose upstream is a local stub that refuses it, so nothing reaches Anthropic's
+    Messages API and no plan usage is spent. Unlike ``claude auth status``, the process cannot
+    exit before the rotated token is saved: it needs the token to send the request.
+
+    Returns ``{ok, error}``; never raises."""
+    import http.server
+    import threading
+
+    try:
+        from .directsdk import Client, ClaudeCodeLoggedOut, ClaudeCodeMissing
+    except ImportError:
+        from directsdk import Client, ClaudeCodeLoggedOut, ClaudeCodeMissing
+
+    class Refuse(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass  # the request carries the login's bearer token: never logged, never read
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            body = json.dumps({"type": "error", "error": {"type": "invalid_request_error", "message": REFRESH_REFUSAL}}).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Refuse)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .05}, daemon=True)
+    thread.start()
+    client = None
+    try:
+        child = dict(env if env is not None else os.environ)
+        child["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{server.server_port}"
+        client = Client(command=command, env=child, timeout=timeout, api_key=account_ref(config_dir))
+        client.expects_refusal = True  # not a failure worth a diagnostic
+        try:
+            client._create_prepared(client.api_key, model="haiku", max_tokens=16, messages=[{"role": "user", "content": "ok"}])
+        except ClaudeCodeLoggedOut:
+            return {"ok": False, "error": "sign-in expired — sign in again"}
+        except ClaudeCodeMissing:
+            return {"ok": False, "error": "Claude Code is not installed"}
+        except Exception:
+            pass  # the stub's refusal: expected. What matters is the credential file, below.
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+        server.shutdown()
+        thread.join()
+        server.server_close()
+    if not login_state(config_dir)["logged_in"]:
+        return {"ok": False, "error": "sign-in expired — sign in again"}
+    if token_expired(config_dir, margin=0):
+        return {"ok": False, "error": "Claude Code did not renew the token"}
+    return {"ok": True, "error": ""}
 
 
 # --- `hermes auth <action> claude-subscription-directsdk-experimental` ----------------------------

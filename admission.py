@@ -704,6 +704,7 @@ class Admission:
         self.status = None
         self.reset_epoch = None  # anthropic-ratelimit-unified-reset of a 429: when the binding window reopens
         self.limit_claim = None  # anthropic-ratelimit-unified-representative-claim of a 429: which limit bound
+        self.ratelimit = {}  # every anthropic-ratelimit-unified-* header of the answer (limit state, extra usage)
         self.failure = None
         self.unrestored = None
         self.capture = Capture()
@@ -901,6 +902,8 @@ class Handler(BaseHTTPRequestHandler):
             del headers, payload, wire
             gate.request_id = response.getheader('request-id') or response.getheader('x-request-id')
             gate.status = response.status
+            gate.ratelimit = {key.lower(): value for key, value in response.getheaders()
+                              if key.lower().startswith('anthropic-ratelimit-unified-')}
             if response.status == 429:
                 reset = response.getheader('anthropic-ratelimit-unified-reset') or response.getheader('retry-after')
                 gate.limit_claim = response.getheader('anthropic-ratelimit-unified-representative-claim')

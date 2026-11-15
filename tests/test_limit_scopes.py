@@ -12,7 +12,8 @@ from conftest import PLUGIN_NAME
 @pytest.mark.parametrize('claim,message,model,scope', [
     ('five_hour', '', 'claude-fable-5-2[1m]', 'all'),
     ('seven_day', '', 'claude-opus-5-5', 'all'),
-    ('seven_day_overage_included', '', 'fable', 'all'),
+    # The weekly limit of the credit-billed models: the requested model's own, not the account's.
+    ('seven_day_overage_included', '', 'claude-fable-5-2[1m]', 'fable'),
     ('seven_day_opus', '', 'claude-opus-5-5[1m]', 'opus'),
     ('seven_day_omelette', '', 'claude-fable-5-2[1m]', 'all'),  # unknown claim is not inferred from model
     ('fable', '', 'claude-fable-5-2[1m]', 'fable'),

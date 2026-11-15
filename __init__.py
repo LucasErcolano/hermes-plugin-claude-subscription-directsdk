@@ -62,6 +62,10 @@ def _usage_details(payload, windows):
     extra = payload.get('extra_usage') if isinstance(payload.get('extra_usage'), dict) else None
     if extra is not None:
         spent, cap = _percent(extra.get('used_credits')), _percent(extra.get('monthly_limit'))
+        # Amounts arrive in minor units (cents) with `decimal_places`.
+        places = extra.get('decimal_places')
+        unit = 10 ** (places if isinstance(places, int) and not isinstance(places, bool) and 0 <= places <= 6 else 0)
+        spent, cap = (spent / unit if spent is not None else None), (cap / unit if cap is not None else None)
         currency = extra.get('currency') or 'USD'
         if not extra.get('is_enabled'):
             reason = extra.get('disabled_reason')

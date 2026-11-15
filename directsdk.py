@@ -1089,6 +1089,25 @@ class Client:
         exc.resets_at = int(until) if until else None
         return exc
 
+    def _note_extra_usage(self, api_key, model, admission):
+        """An answer paid from usage credits ("extra usage"): record it, and when the operator has
+        turned extra usage off for this account, bench the account at the limit it is past so
+        the next request goes elsewhere. This answer is already paid for and is delivered."""
+        try:
+            headers = admission.ratelimit
+            if not limits.overage_in_use(headers):
+                return
+            scope, until = limits.overage_scope(headers, model)
+            benched = limits.apply_extra_usage_policy(api_key, [(scope, until)])
+            # Header names and values only (utilisation, statuses, reset times): no account, no content.
+            logging.getLogger('claude_directsdk.extra_usage').log(
+                logging.WARNING if benched else logging.INFO,
+                'answer paid from usage credits: model=%s limit=%s benched=%s request=%s headers=%s', model, scope,
+                bool(benched), admission.request_id,
+                json.dumps({k.removeprefix(limits.HEADER_PREFIX): v for k, v in sorted(headers.items())}))
+        except Exception:
+            pass  # bookkeeping must never fail a delivered answer
+
     def _create_one(self, request, **kwargs):
         try:
             return self._create_prepared(request, **kwargs)
@@ -1098,6 +1117,8 @@ class Client:
             raise
 
     def _record_failure(self, exc, kwargs, api_key, **context):
+        if getattr(self, 'expects_refusal', False):
+            return  # accounts.refresh_token: the request is refused on purpose, by its own stub
         try:
             from .diagnostics import record
         except ImportError:
@@ -1404,6 +1425,7 @@ class Client:
                         raise exc
                     assistants = [admission.capture.message]
                     stopped = True
+                    self._note_extra_usage(request.api_key, kwargs['model'], admission)
                 native_failure_handled = admission.denied or (admission.used and assistants[0].get('stop_reason') == 'refusal')
                 if native_error and not native_failure_handled:
                     if native_error_code == 'authentication_failed' and not admission.used:

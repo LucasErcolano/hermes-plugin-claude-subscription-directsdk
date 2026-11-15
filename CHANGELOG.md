@@ -22,6 +22,26 @@
 - A multiplexed gateway (`gateway.multiplex_profiles: true`) runs each profile's Claude Code on that profile's own login. `CLAUDE_CODE_OAUTH_TOKEN` in a served profile's `.env` now reaches its Claude Code children (read from core's per-turn secret scope; multiplexing never loads it into the process environment). A served profile without a token of its own no longer inherits the gateway process's token, `ANTHROPIC_CUSTOM_HEADERS` or `CLAUDE_CONFIG_DIR`, with or without `claude_config_dir` (Claude Code prefers the token over the selected login directory), so no profile runs on another profile's account. A served profile with neither its own token nor its own config directory is refused with a login error naming both ways to give it one (`claude_config_dir`, or `CLAUDE_CODE_OAUTH_TOKEN` in its `.env`), since Claude Code would otherwise read `~/.claude` under the inherited home. With no secret scope bound, the request and the setup probes fail closed instead of guessing. Single-profile installs and an explicit `Client(env=...)` are unchanged, and the process environment is never modified (#34, #313, thanks @kalfian).
 - `/usage` shows the extra-usage state, usage credits spent, this week's share per surface and the per-model limits beside the plan limits. They were dropped whenever Claude Code answered with `limits`, which current versions always do.
 - `/usage` shows the plan limits with `claude_code_telemetry: false`: the CLI skips its `get_usage` fetch under `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, so the zero-inference usage probe no longer sets that one flag (telemetry and error reporting stay off; a flag the user exported is kept).
+## [0.3.11] - Unreleased
+
+Local fork: account controls on the Claude Accounts dashboard tab.
+
+- The tab shows every bench on an account by limit category (all models, or one model family),
+  with its end time and why it exists: a plan limit, a manual bench, or the extra-usage policy.
+  Each can be cleared on its own.
+- Bench an account by hand for a category, for a set time or until cleared. A bench on "all"
+  kept by the plugin now covers every model.
+- Extra usage (usage credits) can be blocked per account. A blocked account is benched at each
+  plan limit it has spent (read from the usage API, and from the rate-limit headers of an
+  answer that was paid from credits), so requests move to the next account or fallback model.
+- `seven_day_overage_included` is the requested model's own weekly limit, not an account-wide
+  one: it no longer benches the whole account.
+- An expired access token is renewed automatically through Claude Code, against a local stub
+  that refuses the request, so no plan usage is spent. "Limits unavailable: token expired" is gone.
+- Sign an account in again in place: same pool entry, directory, label, priority and benches.
+  The old login is only replaced after the new sign-in succeeds.
+- Extra-usage amounts are read in minor units (`decimal_places`).
+
 ## [0.3.10] - Unreleased
 
 - Record model-family subscription limits separately from account-wide cooldowns. Explicit Fable limits do not bench Opus; all-model/session limits still block both. Capture the upstream representative claim and use the provider error-classification hook for exhausted model families, preserving Hermes' ordered mixed-provider fallback chain.
