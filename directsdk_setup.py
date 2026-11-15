@@ -213,7 +213,7 @@ PROFILE_LOGIN_HINT = (f"This profile has no Claude login of its own, and Claude 
                       f"in this profile's .env.")
 
 
-def apply_profile_credential(env):
+def apply_profile_credential(env, *, pooled_dir=None):
     """Give a child ``env`` (in place) the active profile's Claude login, never another profile's.
 
     Claude Code prefers ``CLAUDE_CODE_OAUTH_TOKEN`` over the login in ``CLAUDE_CONFIG_DIR``. The profile's
@@ -233,6 +233,12 @@ def apply_profile_credential(env):
             env[name] = value
         elif routed:
             env.pop(name, None)
+    if pooled_dir:
+        # Explicit account from the serving profile's pool owns authentication.
+        # Never let a scoped or inherited token override its directory login.
+        env.pop(OAUTH_TOKEN_ENV, None)
+        env['CLAUDE_CONFIG_DIR'] = pooled_dir
+        return env
     setting = _setting(CONFIG_DIR_SETTING)
     selected = setting.strip() if isinstance(setting, str) else ""
     if selected and not (get_secret and _scoped(get_secret, OAUTH_TOKEN_ENV)):

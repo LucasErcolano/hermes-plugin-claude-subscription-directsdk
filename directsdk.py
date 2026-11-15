@@ -1187,10 +1187,10 @@ class Client:
                 if resolved is None:
                     raise ClaudeCodeMissing(INSTALL_HINT)
                 apply_config_dir(env)
-                if self.env is None:
-                    # The serving profile's own token, or none when its claude_config_dir picks the login.
-                    apply_profile_credential(env)
                 pooled = account_dir(request.api_key)
+                if self.env is None:
+                    # Explicit pooled login satisfies profile isolation before its guard runs.
+                    apply_profile_credential(env, pooled_dir=pooled)
                 if pooled:
                     # The pooled login wins over every directory setting: that is what the pool entry means.
                     env['CLAUDE_CONFIG_DIR'] = pooled

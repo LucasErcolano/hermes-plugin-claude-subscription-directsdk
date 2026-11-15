@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.2] - Unreleased
+
+- Let an explicitly selected pooled login satisfy routed-profile credential isolation; strip OAuth token overrides so the selected account owns authentication. Non-pooled profiles retain the isolation guard.
+- Dashboard owns its usage endpoint rather than referencing the removed provider constant.
+- Verified real Opus request under simulated routed scope; three regression tests added.
+
 ## [0.4.1] - Unreleased (Lermex fork)
 
 The fork's account pool (0.3.4–0.3.11 below: pooled subscriptions, the Claude Accounts tab, per-family benches, account controls) replayed onto upstream 0.4.0.
