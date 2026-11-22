@@ -32,7 +32,7 @@ try:
     from .process_tree import kill_process_tree, own_process_group, unreaped
     from .directsdk_setup import (
         ClaudeCodeLoggedOut, INSTALL_HINT, LOGGED_OUT_HINT, _resolve as resolve_claude, apply_config_dir, apply_profile_credential,
-        apply_traffic_policy, check_extra_usage, drop_api_credentials, egress_env, max_concurrent, observe_rate_limit,
+        apply_traffic_policy, check_extra_usage, drop_api_credentials, egress_env, max_concurrent, observe_rate_limit, quota_retry_settings,
         reap_orphaned_refresh_lock, relay, resolve_upstream, Upstream)
     from .accounts import account_dir, reset_epoch_from_message
     from . import limits
@@ -42,7 +42,7 @@ except ImportError:
     from process_tree import kill_process_tree, own_process_group, unreaped
     from directsdk_setup import (
         ClaudeCodeLoggedOut, INSTALL_HINT, LOGGED_OUT_HINT, _resolve as resolve_claude, apply_config_dir, apply_profile_credential,
-        apply_traffic_policy, check_extra_usage, drop_api_credentials, egress_env, max_concurrent, observe_rate_limit,
+        apply_traffic_policy, check_extra_usage, drop_api_credentials, egress_env, max_concurrent, observe_rate_limit, quota_retry_settings,
         reap_orphaned_refresh_lock, relay, resolve_upstream, Upstream)
     from accounts import account_dir, reset_epoch_from_message
     import limits
@@ -450,6 +450,15 @@ class Request:
         self.cancelled = threading.Event()
         self.admission = None
         self.lock = threading.Lock()
+        self._followed = None  # a logical call follows its current native attempt
+
+    def follow(self, child):
+        """Keep cancellation attached to the logical call across account switches."""
+        with self.lock:
+            self._followed = child
+            cancelled = self.cancelled.is_set()
+        if cancelled and child is not None:
+            child.cancel()
 
     def cancel(self):
         self.cancelled.set()
@@ -458,6 +467,9 @@ class Request:
         with self.lock:
             if self.process is not None:
                 kill_process_tree(self.process)
+            child = self._followed
+        if child is not None:
+            child.cancel()
 
     def spawn(self, command, *, stdin=subprocess.DEVNULL, **kwargs):
         with self.lock:
@@ -737,56 +749,183 @@ def _stream_has_output(chunk):
     return bool(getattr(chunk, 'usage', None))
 
 
-class RotatingStream:
-    """Move to another account on a subscription limit before any model output.
+def _quota_exhaustion(exc):
+    """Only subscription quota exhaustion (not a generic 429) can trigger deferred retries."""
+    if not isinstance(exc, ClaudeAPIError) or exc.status_code != 429:
+        return False
+    if getattr(exc, 'limit_scope', None) or getattr(exc, 'scope_exhausted', False):
+        return True
+    body = getattr(exc, 'body', None) or {}
+    detail = body.get('error', {}) if isinstance(body, dict) else {}
+    return isinstance(detail, dict) and detail.get('type') == 'usage_limit_reached'
 
-    Empty liveness chunks do not commit a request; once actual output (including
-    thinking or tool-call data) is emitted, nothing is replayed.
+
+class QuotaRecovery:
+    """Bounded, cancellation-aware retry across pool resets for one logical request.
+
+    The global Claude Code slot is held only inside a native attempt, never while
+    waiting. A quota-recovery cycle is counted when starting a new complete pool
+    sweep; the accumulated sleeping budget is not reset between cycles.
     """
 
-    def __init__(self, client, kwargs, key, attempted, request=None):
+    def __init__(self, client, model, guard):
+        self.client, self.model, self.guard = client, model, guard
+        self.wait_budget, self.max_cycles = quota_retry_settings()
+        self.waited = 0.0
+        self.cycles = 0
+
+    def step(self, error):
+        """Return (available account, 0) or (None, short wait in seconds); else raise error."""
+        if self.guard.cancelled.is_set():
+            raise RuntimeError('Claude request cancelled')
+        if not _quota_exhaustion(error) or self.cycles >= self.max_cycles:
+            raise error
+        from agent.credential_pool import load_pool
+        pool = load_pool(POOL_PROVIDER)
+        if not pool.has_credentials():
+            raise error
+        # A previously attempted account can already have reopened by the time
+        # the last one returned its 429. This is a NEW sweep, so clear attempted.
+        try:
+            key = self.client._serving_key(self.model, set())
+        except ClaudeAPIError as unavailable:
+            if not _quota_exhaustion(unavailable):
+                raise error
+            core_reset = pool.next_available_at(model=self.model)
+            body = getattr(unavailable, 'body', None) or {}
+            detail = body.get('error', {}) if isinstance(body, dict) else {}
+            scoped_reset = detail.get('resets_at') if isinstance(detail, dict) else None
+            now = time.time()
+            future = [float(t) for t in (core_reset, scoped_reset)
+                      if isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) > now]
+            left = self.wait_budget - self.waited
+            if not future or left <= 0 or min(future) - now > left:
+                raise error  # unknown reset or outside the wait budget: let Hermes fall back
+            return None, min(1.0, left, max(.05, min(future) - now))
+        self.cycles += 1
+        logger.info('Claude quota reset: resuming request on an available pooled login (cycle %d/%d)',
+                    self.cycles, self.max_cycles)
+        return key, 0.0
+
+    def sleep(self, seconds):
+        started = time.monotonic()
+        self.guard.cancelled.wait(seconds)
+        self.waited += time.monotonic() - started
+        if self.guard.cancelled.is_set():
+            raise RuntimeError('Claude request cancelled')
+
+    def wait_for_key(self, error):
+        while True:
+            key, delay = self.step(error)
+            if key is not None:
+                return key
+            self.sleep(delay)
+
+
+class RotatingStream:
+    """Retry quota-limited accounts only before semantic streaming output.
+
+    Empty heartbeat chunks preserve Hermes liveness while waiting for the first
+    account to reopen. Client cancellation propagates across all attempts.
+    """
+
+    def __init__(self, client, kwargs, key, attempted, guard, recovery, initial_error=None):
         self.client, self.kwargs, self.key, self.attempted = client, kwargs, key, attempted
-        self.yielded = False
-        # Eager, like a plain stream: request validation errors surface from create() itself.
-        attempted.add(key)
-        if request is not None:
-            request.api_key = key  # the caller's registered request (async cancel reaches it)
-        self.inner = client._create_one(request or client._register(key), **kwargs)
+        self.guard, self.recovery, self.error = guard, recovery, initial_error
+        self.yielded, self.inner, self.closed = False, None, False
+        guard.stream = weakref.ref(self)
+        if key is not None:  # keep eager native request validation
+            self._start(key)
 
     @property
     def request(self):
-        return getattr(self.inner, 'request', None)
+        # Preserve the established streaming API: callers inspect the active
+        # native request's process (e.g. to verify process-tree cancellation).
+        # During a quota wait there is no native child; expose the guard then.
+        return getattr(self.inner, 'request', None) or self.guard
+
+    def _start(self, key):
+        self.key = key
+        self.attempted.add(key)
+        child = self.client._register(key)
+        self.guard.follow(child)
+        try:
+            self.inner = self.client._create_one(child, **self.kwargs)
+        except BaseException:
+            with self.client._lock:
+                self.client._requests.discard(child)
+            self.guard.follow(None)
+            raise
+
+    def _close_inner(self):
+        inner, self.inner = self.inner, None
+        with self.guard.lock:
+            child = self.guard._followed
+        try:
+            if inner is not None and callable(getattr(inner, 'close', None)):
+                inner.close()
+        finally:
+            self.guard.follow(None)
+            if child is not None:
+                with self.client._lock:
+                    self.client._requests.discard(child)
+
+    def _limit(self, exc):
+        if self.yielded:
+            raise exc  # NEVER replay text, thinking, tools or final output
+        self._close_inner()
+        try:
+            self.key = self.client._after_limit(exc, self.key, self.kwargs.get('model'), self.attempted)
+        except ClaudeAPIError as last:
+            if not _quota_exhaustion(last):
+                raise
+            self.error, self.key = last, None
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        while True:
-            if self.inner is None:
-                self.attempted.add(self.key)
-                self.inner = self.client._create_one(self.client._register(self.key), **self.kwargs)
-            try:
-                chunk = next(self.inner)
-            except ClaudeAPIError as exc:
-                if self.yielded:
-                    raise
-                self.close()
-                self.key = self.client._after_limit(exc, self.key, self.kwargs.get('model'), self.attempted)
-                continue
-            self.yielded = self.yielded or _stream_has_output(chunk)
-            return chunk
+        try:
+            while True:
+                if self.guard.cancelled.is_set():
+                    raise RuntimeError('Claude request cancelled')
+                if self.inner is None:
+                    if self.key is None:
+                        key, delay = self.recovery.step(self.error)
+                        if key is None:
+                            self.recovery.sleep(delay)
+                            return self.client._chunk(self.kwargs['model'], {})
+                        self.attempted.clear()
+                        self.key = key
+                    try:
+                        self._start(self.key)
+                    except ClaudeAPIError as exc:
+                        self._limit(exc)
+                        continue
+                try:
+                    chunk = next(self.inner)
+                except ClaudeAPIError as exc:
+                    self._limit(exc)
+                    continue
+                self.yielded = self.yielded or _stream_has_output(chunk)
+                return chunk
+        except BaseException:
+            self.close()
+            raise
 
     def close(self):
-        inner, self.inner = self.inner, None
-        if inner is not None and callable(getattr(inner, 'close', None)):
-            inner.close()
+        if not self.closed:
+            self.closed = True
+            self.guard.cancel()
+            self._close_inner()
+            with self.client._lock:
+                self.client._requests.discard(self.guard)
 
     def __enter__(self):
         return self
 
     def __exit__(self, *_):
         self.close()
-
 
 class AsyncStream:
     def __init__(self, stream):
@@ -996,45 +1135,73 @@ class Client:
         return ClaudeAPIError(error['message'], status_code=429, body={'error': error})
 
     def _create(self, request=None, **kwargs):
-        if self._pool_exhausted_until is not None:
-            # Built while the pool was empty. If an account has reopened since, use it (the same
-            # pool, never ambient login); otherwise fail as a plan limit so core falls back.
-            from agent.credential_pool import load_pool
-            entry = load_pool(POOL_PROVIDER).select()
-            if entry is None or not account_dir(entry.runtime_api_key):
-                if request is not None:
-                    with self._lock:
-                        self._requests.discard(request)
-                raise self._pool_exhausted_error()
-            self.api_key, self._pool_exhausted_until, self._pooled_auxiliary = entry.runtime_api_key, None, True
-            if request is not None:
-                request.api_key = self.api_key
-        model = kwargs.get('model')
-        attempted = set()
+        # One logical request survives account rotations. Its cancellation guard
+        # stays registered during deferred waits, while each native attempt has
+        # its own request and uses the usual process-tree cleanup.
+        guard = request or self._register()
+        transferred_to_stream = False
         try:
-            key = self._serving_key(model, attempted)
-        except BaseException:
-            if request is not None:
-                with self._lock:
-                    self._requests.discard(request)
-            raise
-        if kwargs.get('stream'):
-            while True:
-                try:
-                    return RotatingStream(self, kwargs, key, attempted, request if not attempted else None)
-                except ClaudeAPIError as exc:
-                    key = self._after_limit(exc, key, model, attempted)
-        while True:
-            attempted.add(key)
-            # The caller's registered request (async cancel reaches it) serves the first attempt.
-            if request is not None and len(attempted) == 1:
-                attempt, request.api_key = request, key
-            else:
-                attempt = self._register(key)
+            model = kwargs.get('model')
+            if self._pool_exhausted_until is not None:
+                # Built while every credential was exhausted. Resolve again now;
+                # if still exhausted, the retry coordinator may await the reset.
+                from agent.credential_pool import load_pool
+                entry = load_pool(POOL_PROVIDER).select(model=model) if model else load_pool(POOL_PROVIDER).select()
+                self._pooled_auxiliary = True
+                if entry is not None and account_dir(entry.runtime_api_key):
+                    self.api_key, self._pool_exhausted_until = entry.runtime_api_key, None
+            recovery = QuotaRecovery(self, model, guard)
+            attempted = set()
             try:
-                return self._create_one(attempt, **kwargs)
+                key = self._serving_key(model, attempted)
+                initial_error = None
             except ClaudeAPIError as exc:
-                key = self._after_limit(exc, key, model, attempted)
+                if not _quota_exhaustion(exc):
+                    raise
+                key, initial_error = None, exc
+
+            if kwargs.get('stream'):
+                while True:
+                    try:
+                        stream = RotatingStream(self, kwargs, key, attempted, guard, recovery, initial_error)
+                    except ClaudeAPIError as exc:
+                        if not _quota_exhaustion(exc):
+                            raise
+                        try:
+                            key = self._after_limit(exc, key, model, attempted)
+                        except ClaudeAPIError as unavailable:
+                            if not _quota_exhaustion(unavailable):
+                                raise
+                            key, initial_error = None, unavailable
+                        continue
+                    transferred_to_stream = True
+                    return stream
+
+            if key is None:
+                key = recovery.wait_for_key(initial_error)
+                attempted.clear()
+            while True:
+                if guard.cancelled.is_set():
+                    raise RuntimeError('Claude request cancelled')
+                attempted.add(key)
+                attempt = self._register(key)
+                guard.follow(attempt)
+                try:
+                    return self._create_one(attempt, **kwargs)
+                except ClaudeAPIError as exc:
+                    try:
+                        key = self._after_limit(exc, key, model, attempted)
+                    except ClaudeAPIError as unavailable:
+                        key = recovery.wait_for_key(unavailable)
+                        attempted.clear()
+                finally:
+                    guard.follow(None)
+                    with self._lock:
+                        self._requests.discard(attempt)
+        finally:
+            if not transferred_to_stream:
+                with self._lock:
+                    self._requests.discard(guard)
 
     def _pool_keys(self, model):
         """Pooled account refs core considers available for *model*, in pool order; ``None`` when
