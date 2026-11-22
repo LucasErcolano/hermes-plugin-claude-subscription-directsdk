@@ -823,55 +823,99 @@ class QuotaRecovery:
 
 
 class RotatingStream:
-    """Move to another account on a subscription limit before any model output.
+    """Retry quota-limited accounts only before semantic streaming output.
 
-    Empty liveness chunks do not commit a request; once actual output (including
-    thinking or tool-call data) is emitted, nothing is replayed.
+    Empty heartbeat chunks preserve Hermes liveness while waiting for the first
+    account to reopen. Client cancellation propagates across all attempts.
     """
 
-    def __init__(self, client, kwargs, key, attempted, request=None):
+    def __init__(self, client, kwargs, key, attempted, guard, recovery, initial_error=None):
         self.client, self.kwargs, self.key, self.attempted = client, kwargs, key, attempted
-        self.yielded = False
-        # Eager, like a plain stream: request validation errors surface from create() itself.
-        attempted.add(key)
-        if request is not None:
-            request.api_key = key  # the caller's registered request (async cancel reaches it)
-        self.inner = client._create_one(request or client._register(key), **kwargs)
+        self.guard, self.recovery, self.error = guard, recovery, initial_error
+        self.yielded, self.inner, self.closed = False, None, False
+        guard.stream = weakref.ref(self)
+        if key is not None:  # keep eager native request validation
+            self._start(key)
 
     @property
     def request(self):
-        return getattr(self.inner, 'request', None)
+        return self.guard
+
+    def _start(self, key):
+        self.key = key
+        self.attempted.add(key)
+        child = self.client._register(key)
+        self.guard.follow(child)
+        try:
+            self.inner = self.client._create_one(child, **self.kwargs)
+        except BaseException:
+            with self.client._lock:
+                self.client._requests.discard(child)
+            self.guard.follow(None)
+            raise
+
+    def _close_inner(self):
+        inner, self.inner = self.inner, None
+        if inner is not None and callable(getattr(inner, 'close', None)):
+            inner.close()
+        self.guard.follow(None)
+
+    def _limit(self, exc):
+        if self.yielded:
+            raise exc  # NEVER replay text, thinking, tools or final output
+        self._close_inner()
+        try:
+            self.key = self.client._after_limit(exc, self.key, self.kwargs.get('model'), self.attempted)
+        except ClaudeAPIError as last:
+            if not _quota_exhaustion(last):
+                raise
+            self.error, self.key = last, None
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        while True:
-            if self.inner is None:
-                self.attempted.add(self.key)
-                self.inner = self.client._create_one(self.client._register(self.key), **self.kwargs)
-            try:
-                chunk = next(self.inner)
-            except ClaudeAPIError as exc:
-                if self.yielded:
-                    raise
-                self.close()
-                self.key = self.client._after_limit(exc, self.key, self.kwargs.get('model'), self.attempted)
-                continue
-            self.yielded = self.yielded or _stream_has_output(chunk)
-            return chunk
+        try:
+            while True:
+                if self.guard.cancelled.is_set():
+                    raise RuntimeError('Claude request cancelled')
+                if self.inner is None:
+                    if self.key is None:
+                        key, delay = self.recovery.step(self.error)
+                        if key is None:
+                            self.recovery.sleep(delay)
+                            return self.client._chunk(self.kwargs['model'], {})
+                        self.attempted.clear()
+                        self.key = key
+                    try:
+                        self._start(self.key)
+                    except ClaudeAPIError as exc:
+                        self._limit(exc)
+                        continue
+                try:
+                    chunk = next(self.inner)
+                except ClaudeAPIError as exc:
+                    self._limit(exc)
+                    continue
+                self.yielded = self.yielded or _stream_has_output(chunk)
+                return chunk
+        except BaseException:
+            self.close()
+            raise
 
     def close(self):
-        inner, self.inner = self.inner, None
-        if inner is not None and callable(getattr(inner, 'close', None)):
-            inner.close()
+        if not self.closed:
+            self.closed = True
+            self.guard.cancel()
+            self._close_inner()
+            with self.client._lock:
+                self.client._requests.discard(self.guard)
 
     def __enter__(self):
         return self
 
     def __exit__(self, *_):
         self.close()
-
 
 class AsyncStream:
     def __init__(self, stream):
