@@ -25,14 +25,19 @@ jobs:
         with:
           repository: NousResearch/hermes-agent
           path: hermes-agent
-      # Hermes core gates every runtime dependency on python_version >= '3.14'; older Pythons install none of them.
-      - uses: actions/setup-python@v5
+      # Hermes manages its dependency overrides in uv.lock. pip install -e
+      # cannot apply the Pillow override required by browser-harness.
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
-          python-version: "3.14"
-      - name: Install hermes-agent
-        run: python -m pip install -e ./hermes-agent pytest
+          version: "0.12.13"
+      - name: Install Python
+        run: uv python install 3.14
+      - name: Install Hermes core and tests from the lockfile
+        working-directory: hermes-agent
+        run: uv sync --locked --python 3.14 --group dev
       - name: Run the plugin suite (real subprocess tree, real cancellation)
         working-directory: plugin
         env:
           HERMES_AGENT_REPO: ${{ github.workspace }}/hermes-agent
-        run: python -m pytest -q
+        run: uv run --project ../hermes-agent --no-sync python -m pytest -q
