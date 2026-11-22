@@ -47,8 +47,9 @@ config_schema:
     label: Maximum time to await a subscription quota reset (seconds)
     description: >-
       When every Claude account is temporarily unavailable, wait only if the next known
-      quota reset fits inside this cumulative per-request budget. Zero disables deferred
-      retries. The default is 120 seconds; no slot is held while waiting.
+      quota reset fits inside this cumulative per-request budget. Zero disables
+      waiting, but an already-reopened account can still be retried immediately.
+      The default is 120 seconds; no slot is held while waiting.
   quota_retry_max_cycles:
     type: int
     default: 2
