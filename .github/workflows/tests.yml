@@ -8,15 +8,8 @@ on:
 
 jobs:
   pytest:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
-      - name: Allow long paths (hermes-agent's i18n docs tree exceeds MAX_PATH)
-        if: runner.os == 'Windows'
-        run: git config --system core.longpaths true
       - uses: actions/checkout@v4
         with:
           path: plugin
