@@ -839,7 +839,10 @@ class RotatingStream:
 
     @property
     def request(self):
-        return self.guard
+        # Preserve the established streaming API: callers inspect the active
+        # native request's process (e.g. to verify process-tree cancellation).
+        # During a quota wait there is no native child; expose the guard then.
+        return getattr(self.inner, 'request', None) or self.guard
 
     def _start(self, key):
         self.key = key
