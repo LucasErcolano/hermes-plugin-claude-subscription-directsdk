@@ -140,6 +140,8 @@ def test_recovery_is_bounded_after_repeated_immediate_reopenings(
         calls.append(name)
         # Give another attempt immediate availability, even if its latest
         # response was a 429. Every retry cycle must still be bounded.
+        if name == "first" and calls.count("first") > 1:
+            load_pool(PLUGIN_NAME).reset_status("second")
         if name == "second":
             load_pool(PLUGIN_NAME).reset_status("first")
         raise _quota(error_type, time.time() + 3600)
