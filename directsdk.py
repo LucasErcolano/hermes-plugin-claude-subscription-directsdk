@@ -32,7 +32,7 @@ try:
     from .process_tree import kill_process_tree, own_process_group, unreaped
     from .directsdk_setup import (
         ClaudeCodeLoggedOut, INSTALL_HINT, LOGGED_OUT_HINT, _resolve as resolve_claude, apply_config_dir, apply_profile_credential,
-        apply_traffic_policy, check_extra_usage, drop_api_credentials, egress_env, max_concurrent, observe_rate_limit,
+        apply_traffic_policy, check_extra_usage, drop_api_credentials, egress_env, max_concurrent, observe_rate_limit, quota_retry_settings,
         reap_orphaned_refresh_lock, relay, resolve_upstream, Upstream)
     from .accounts import account_dir, reset_epoch_from_message
     from . import limits
@@ -42,7 +42,7 @@ except ImportError:
     from process_tree import kill_process_tree, own_process_group, unreaped
     from directsdk_setup import (
         ClaudeCodeLoggedOut, INSTALL_HINT, LOGGED_OUT_HINT, _resolve as resolve_claude, apply_config_dir, apply_profile_credential,
-        apply_traffic_policy, check_extra_usage, drop_api_credentials, egress_env, max_concurrent, observe_rate_limit,
+        apply_traffic_policy, check_extra_usage, drop_api_credentials, egress_env, max_concurrent, observe_rate_limit, quota_retry_settings,
         reap_orphaned_refresh_lock, relay, resolve_upstream, Upstream)
     from accounts import account_dir, reset_epoch_from_message
     import limits
@@ -450,6 +450,15 @@ class Request:
         self.cancelled = threading.Event()
         self.admission = None
         self.lock = threading.Lock()
+        self._followed = None  # a logical call follows its current native attempt
+
+    def follow(self, child):
+        """Keep cancellation attached to the logical call across account switches."""
+        with self.lock:
+            self._followed = child
+            cancelled = self.cancelled.is_set()
+        if cancelled and child is not None:
+            child.cancel()
 
     def cancel(self):
         self.cancelled.set()
@@ -458,6 +467,9 @@ class Request:
         with self.lock:
             if self.process is not None:
                 kill_process_tree(self.process)
+            child = self._followed
+        if child is not None:
+            child.cancel()
 
     def spawn(self, command, *, stdin=subprocess.DEVNULL, **kwargs):
         with self.lock:
@@ -735,6 +747,79 @@ def _stream_has_output(chunk):
         if getattr(choice, 'finish_reason', None) is not None:
             return True
     return bool(getattr(chunk, 'usage', None))
+
+
+def _quota_exhaustion(exc):
+    """Only subscription quota exhaustion (not a generic 429) can trigger deferred retries."""
+    if not isinstance(exc, ClaudeAPIError) or exc.status_code != 429:
+        return False
+    if getattr(exc, 'limit_scope', None) or getattr(exc, 'scope_exhausted', False):
+        return True
+    body = getattr(exc, 'body', None) or {}
+    detail = body.get('error', {}) if isinstance(body, dict) else {}
+    return isinstance(detail, dict) and detail.get('type') == 'usage_limit_reached'
+
+
+class QuotaRecovery:
+    """Bounded, cancellation-aware retry across pool resets for one logical request.
+
+    The global Claude Code slot is held only inside a native attempt, never while
+    waiting. A quota-recovery cycle is counted when starting a new complete pool
+    sweep; the accumulated sleeping budget is not reset between cycles.
+    """
+
+    def __init__(self, client, model, guard):
+        self.client, self.model, self.guard = client, model, guard
+        self.wait_budget, self.max_cycles = quota_retry_settings()
+        self.waited = 0.0
+        self.cycles = 0
+
+    def step(self, error):
+        """Return (available account, 0) or (None, short wait in seconds); else raise error."""
+        if self.guard.cancelled.is_set():
+            raise RuntimeError('Claude request cancelled')
+        if not _quota_exhaustion(error) or self.cycles >= self.max_cycles:
+            raise error
+        from agent.credential_pool import load_pool
+        pool = load_pool(POOL_PROVIDER)
+        if not pool.has_credentials():
+            raise error
+        # A previously attempted account can already have reopened by the time
+        # the last one returned its 429. This is a NEW sweep, so clear attempted.
+        try:
+            key = self.client._serving_key(self.model, set())
+        except ClaudeAPIError as unavailable:
+            if not _quota_exhaustion(unavailable):
+                raise error
+            core_reset = pool.next_available_at(model=self.model)
+            body = getattr(unavailable, 'body', None) or {}
+            detail = body.get('error', {}) if isinstance(body, dict) else {}
+            scoped_reset = detail.get('resets_at') if isinstance(detail, dict) else None
+            now = time.time()
+            future = [float(t) for t in (core_reset, scoped_reset)
+                      if isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) > now]
+            left = self.wait_budget - self.waited
+            if not future or left <= 0 or min(future) - now > left:
+                raise error  # unknown reset or outside the wait budget: let Hermes fall back
+            return None, min(1.0, left, max(.05, min(future) - now))
+        self.cycles += 1
+        logger.info('Claude quota reset: resuming request on an available pooled login (cycle %d/%d)',
+                    self.cycles, self.max_cycles)
+        return key, 0.0
+
+    def sleep(self, seconds):
+        started = time.monotonic()
+        self.guard.cancelled.wait(seconds)
+        self.waited += time.monotonic() - started
+        if self.guard.cancelled.is_set():
+            raise RuntimeError('Claude request cancelled')
+
+    def wait_for_key(self, error):
+        while True:
+            key, delay = self.step(error)
+            if key is not None:
+                return key
+            self.sleep(delay)
 
 
 class RotatingStream:
