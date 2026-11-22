@@ -331,7 +331,7 @@ def native_format_schema(node):
 def request_body(kwargs):
     allowed = {'model', 'messages', 'tools', 'stream', 'stream_options', 'max_tokens', 'max_completion_tokens',
                'temperature', 'top_p', 'stop', 'extra_body', 'extra_headers', 'timeout', 'tool_choice', 'parallel_tool_calls', 'n', 'response_format',
-               'hermes_auxiliary'}
+               'hermes_auxiliary', 'hermes_cache_ttl'}
     unknown = set(kwargs) - allowed
     if unknown:
         raise RequestRejected('Unsupported request parameters: ' + ', '.join(sorted(unknown)))
@@ -715,9 +715,34 @@ class Stream:
         self.close()
 
 
+def _stream_has_output(chunk):
+    """Only visible/semantic output commits a streamed request to its account.
+
+    Slot-wait heartbeats and native progress pings have an empty delta. They keep
+    Hermes' stale timer alive but must not prevent pre-output quota failover.
+    Unknown chunk shapes are treated as output to avoid unsafe replay.
+    """
+    choices = getattr(chunk, 'choices', None)
+    if choices is None:
+        return True
+    for choice in choices:
+        delta = getattr(choice, 'delta', None)
+        if delta is None:
+            return True
+        if any(getattr(delta, key, None) for key in
+               ('content', 'reasoning_content', 'tool_calls', 'reasoning_details', 'refusal')):
+            return True
+        if getattr(choice, 'finish_reason', None) is not None:
+            return True
+    return bool(getattr(chunk, 'usage', None))
+
+
 class RotatingStream:
-    """A streaming request that moves to the next account when a subscription limit answers
-    before any output. Nothing is replayed once a chunk has been yielded."""
+    """Move to another account on a subscription limit before any model output.
+
+    Empty liveness chunks do not commit a request; once actual output (including
+    thinking or tool-call data) is emitted, nothing is replayed.
+    """
 
     def __init__(self, client, kwargs, key, attempted, request=None):
         self.client, self.kwargs, self.key, self.attempted = client, kwargs, key, attempted
@@ -748,7 +773,7 @@ class RotatingStream:
                 self.close()
                 self.key = self.client._after_limit(exc, self.key, self.kwargs.get('model'), self.attempted)
                 continue
-            self.yielded = True
+            self.yielded = self.yielded or _stream_has_output(chunk)
             return chunk
 
     def close(self):
@@ -1210,6 +1235,10 @@ class Client:
                 env.update(ENABLE_TOOL_SEARCH='false', CLAUDE_CODE_MAX_RETRIES='0', DISABLE_AUTO_COMPACT='1', DISABLE_COMPACT='1')
                 # Telemetry and feature flags follow the user's claude_code_telemetry setting, read per spawn.
                 apply_traffic_policy(env)
+                # Hermes asked for a 5m cache on this request (a delegated child). A `-p` turn is native's main
+                # conversation bucket, so its own variable is the one that applies; a tier the user exported wins.
+                if kwargs.get('hermes_cache_ttl') == '5m':
+                    env.setdefault('CLAUDE_CODE_PROMPT_CACHE_TTL', '5m')
                 egress_env(env, upstream)
                 # Hermes owns budgets; native's replayed reminder invalidates cached history.
                 env['CLAUDE_CODE_TOTAL_TOKENS_REMINDER'] = 'off'
