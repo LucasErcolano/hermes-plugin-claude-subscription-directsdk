@@ -167,6 +167,23 @@ def max_concurrent():
     return MAX_CONCURRENT_DEFAULT
 
 
+def quota_retry_settings():
+    """Deferred quota recovery bounds for one logical request, read per request.
+
+    Wait budget is cumulative across cycles, never per-account. Values above
+    3600 seconds / 8 extra sweeps are clamped to prevent unbounded requests.
+    """
+    def value(key, default, maximum):
+        raw = _setting(key, default)
+        if isinstance(raw, str) and raw.strip().isdigit():
+            raw = int(raw.strip())
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+            return default
+        return min(raw, maximum)
+
+    return value("quota_retry_wait_seconds", 120, 3600), value("quota_retry_max_cycles", 2, 8)
+
+
 def apply_config_dir(env):
     """Select the active profile's Claude config directory on a child env, in place."""
     override = env.pop("CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR", None)
