@@ -856,9 +856,16 @@ class RotatingStream:
 
     def _close_inner(self):
         inner, self.inner = self.inner, None
-        if inner is not None and callable(getattr(inner, 'close', None)):
-            inner.close()
-        self.guard.follow(None)
+        with self.guard.lock:
+            child = self.guard._followed
+        try:
+            if inner is not None and callable(getattr(inner, 'close', None)):
+                inner.close()
+        finally:
+            self.guard.follow(None)
+            if child is not None:
+                with self.client._lock:
+                    self.client._requests.discard(child)
 
     def _limit(self, exc):
         if self.yielded:
