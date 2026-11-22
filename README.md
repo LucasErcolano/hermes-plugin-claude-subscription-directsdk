@@ -120,6 +120,33 @@ core's standard credential-pool path: a plan-limit answer is reported as a 429 c
 `usage_limit_reached` and `resets_at` (from `anthropic-ratelimit-unified-reset`, else parsed
 from native's "resets …" text), so `hermes auth list` shows the benched entry and when it reopens.
 
+### Bounded quota-reset recovery
+
+The pool uses Hermes' **`fill_first`** strategy by default: when a subscription hits its
+session/week limit, it is benched until the reported reset. After reaching the last
+account, a **single request** can cycle back to the first if it reopened while other
+accounts were being tried. If no account is ready but a known reset is near, the
+request waits until that reset and retries without restarting Hermes.
+
+Limits (plugin settings, configurable through `hermes config set`):
+
+```bash
+hermes config set plugins.entries.claude-subscription-directsdk-experimental.settings.quota_retry_wait_seconds 120
+hermes config set plugins.entries.claude-subscription-directsdk-experimental.settings.quota_retry_max_cycles 2
+```
+
+The 120-second wait budget is **cumulative per request** (maximum configurable
+3600 seconds); the default permits **two additional pool sweeps** (maximum 8).
+Waiting never holds a Claude Code concurrency slot. Set the wait to 0 to skip
+sleeping until a reset; set max cycles to 0 to disable extra sweeps completely.
+
+An unknown reset or one beyond the remaining budget returns the original 429,
+so Hermes can use its configured fallback. Interrupted requests stop waiting
+promptly. Streams send empty liveness chunks while waiting, but **never repeat**
+a request after real text, thinking, tool data or a terminal response was emitted.
+These are per-request retries, not background re-execution of a partially
+completed conversation.
+
 ### Compression and auxiliary account rotation
 
 Starting with 0.3.5, auxiliary clients created with an external-process placeholder select
