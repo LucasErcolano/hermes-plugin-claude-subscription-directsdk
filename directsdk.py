@@ -1125,45 +1125,73 @@ class Client:
         return ClaudeAPIError(error['message'], status_code=429, body={'error': error})
 
     def _create(self, request=None, **kwargs):
-        if self._pool_exhausted_until is not None:
-            # Built while the pool was empty. If an account has reopened since, use it (the same
-            # pool, never ambient login); otherwise fail as a plan limit so core falls back.
-            from agent.credential_pool import load_pool
-            entry = load_pool(POOL_PROVIDER).select()
-            if entry is None or not account_dir(entry.runtime_api_key):
-                if request is not None:
-                    with self._lock:
-                        self._requests.discard(request)
-                raise self._pool_exhausted_error()
-            self.api_key, self._pool_exhausted_until, self._pooled_auxiliary = entry.runtime_api_key, None, True
-            if request is not None:
-                request.api_key = self.api_key
-        model = kwargs.get('model')
-        attempted = set()
+        # One logical request survives account rotations. Its cancellation guard
+        # stays registered during deferred waits, while each native attempt has
+        # its own request and uses the usual process-tree cleanup.
+        guard = request or self._register()
+        transferred_to_stream = False
         try:
-            key = self._serving_key(model, attempted)
-        except BaseException:
-            if request is not None:
-                with self._lock:
-                    self._requests.discard(request)
-            raise
-        if kwargs.get('stream'):
-            while True:
-                try:
-                    return RotatingStream(self, kwargs, key, attempted, request if not attempted else None)
-                except ClaudeAPIError as exc:
-                    key = self._after_limit(exc, key, model, attempted)
-        while True:
-            attempted.add(key)
-            # The caller's registered request (async cancel reaches it) serves the first attempt.
-            if request is not None and len(attempted) == 1:
-                attempt, request.api_key = request, key
-            else:
-                attempt = self._register(key)
+            model = kwargs.get('model')
+            if self._pool_exhausted_until is not None:
+                # Built while every credential was exhausted. Resolve again now;
+                # if still exhausted, the retry coordinator may await the reset.
+                from agent.credential_pool import load_pool
+                entry = load_pool(POOL_PROVIDER).select(model=model) if model else load_pool(POOL_PROVIDER).select()
+                self._pooled_auxiliary = True
+                if entry is not None and account_dir(entry.runtime_api_key):
+                    self.api_key, self._pool_exhausted_until = entry.runtime_api_key, None
+            recovery = QuotaRecovery(self, model, guard)
+            attempted = set()
             try:
-                return self._create_one(attempt, **kwargs)
+                key = self._serving_key(model, attempted)
+                initial_error = None
             except ClaudeAPIError as exc:
-                key = self._after_limit(exc, key, model, attempted)
+                if not _quota_exhaustion(exc):
+                    raise
+                key, initial_error = None, exc
+
+            if kwargs.get('stream'):
+                while True:
+                    try:
+                        stream = RotatingStream(self, kwargs, key, attempted, guard, recovery, initial_error)
+                    except ClaudeAPIError as exc:
+                        if not _quota_exhaustion(exc):
+                            raise
+                        try:
+                            key = self._after_limit(exc, key, model, attempted)
+                        except ClaudeAPIError as unavailable:
+                            if not _quota_exhaustion(unavailable):
+                                raise
+                            key, initial_error = None, unavailable
+                        continue
+                    transferred_to_stream = True
+                    return stream
+
+            if key is None:
+                key = recovery.wait_for_key(initial_error)
+                attempted.clear()
+            while True:
+                if guard.cancelled.is_set():
+                    raise RuntimeError('Claude request cancelled')
+                attempted.add(key)
+                attempt = self._register(key)
+                guard.follow(attempt)
+                try:
+                    return self._create_one(attempt, **kwargs)
+                except ClaudeAPIError as exc:
+                    try:
+                        key = self._after_limit(exc, key, model, attempted)
+                    except ClaudeAPIError as unavailable:
+                        key = recovery.wait_for_key(unavailable)
+                        attempted.clear()
+                finally:
+                    guard.follow(None)
+                    with self._lock:
+                        self._requests.discard(attempt)
+        finally:
+            if not transferred_to_stream:
+                with self._lock:
+                    self._requests.discard(guard)
 
     def _pool_keys(self, model):
         """Pooled account refs core considers available for *model*, in pool order; ``None`` when
