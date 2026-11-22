@@ -41,6 +41,22 @@ config_schema:
       At most this many Claude Code processes (about 250 MB each) run at once in one Hermes process, across its
       profiles, subagents and auxiliary calls. A call past the limit waits for a free one within its own timeout;
       it is not failed or sent to another provider. /usage and the model picker do not count.
+  quota_retry_wait_seconds:
+    type: int
+    default: 120
+    label: Maximum time to await a subscription quota reset (seconds)
+    description: >-
+      When every Claude account is temporarily unavailable, wait only if the next known
+      quota reset fits inside this cumulative per-request budget. Zero disables deferred
+      retries. The default is 120 seconds; no slot is held while waiting.
+  quota_retry_max_cycles:
+    type: int
+    default: 2
+    label: Additional complete account-pool cycles per request
+    description: >-
+      After an exhausted sweep, retry eligible accounts at most this many more cycles.
+      Also bounds immediate repeated 429 responses with inaccurate reset timestamps.
+      Zero disables deferred retries, even if a previously tried account has reopened.
   extra_usage:
     type: string
     default: notify
